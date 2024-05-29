@@ -21,7 +21,6 @@ cffi==1.16.0
 clip==0.2.0
 cloud_tpu_client==0.10
 comet_ml==3.42.1
-conda==4.3.16
 ConfigParser==7.0.0
 contextlib2==21.6.0
 coremltools==7.2
