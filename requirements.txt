@@ -35,7 +35,6 @@ docutils==0.21.2
 duckdb==0.10.3
 dvclive==3.46.0
 efficientnet_pytorch==0.7.1
-etcd==2.0.8
 expecttest==0.2.1
 fastcluster==1.2.6
 fastparquet==2024.5.0
