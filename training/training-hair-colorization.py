@@ -68,6 +68,15 @@ class HairColorizationTraining:
         print(self.model.summary())
         plot_model(self.model, to_file='autoencoder_colorization_merged.png', show_shapes=True)
 
+    def train(self, image_dir, data_dir, num_train_samples, batch_size, **kwargs):
+        dataset = HairColorizationPyDataset(image_dir, data_dir, num_train_samples, batch_size, **kwargs)
+        steps_per_epoch = np.floor(num_train_samples / batch_size)
+        epochs = 3
+
+        fit_history = self.model.fit(dataset, epochs=3, steps_per_epoch=steps_per_epoch, verbose=1)
+
+        self.model.save('model_merge.h5')
+
 def preprocess_image(img, gray_img, b_mask):
     window_left_top_y, window_left_top_x = img.shape[0], img.shape[1]
     window_right_bottom_y, window_right_bottom_x = 0, 0
