@@ -26,7 +26,6 @@ contextlib2==21.6.0
 coremltools==7.2
 cryptography==42.0.7
 Cython==3.0.10
-deeplearning==0.0.1
 defcon==0.10.3
 defusedxml==0.7.1
 diffusers==0.28.0
