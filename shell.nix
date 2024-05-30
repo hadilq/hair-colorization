@@ -11,9 +11,6 @@ pkgs.mkShell {
     py-cpuinfo
     typing-extensions
     opencv4
-    tqdm
-    psutil
-    dill
     numpy
     pydot
     graphviz
