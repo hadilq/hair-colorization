@@ -1,6 +1,10 @@
 import tensorflow as tf
+from keras.optimizers import Adam
+from keras.metrics import categorical_crossentropy
 from keras.layers import Conv2D
+from keras.layers import MaxPooling2D
 from keras.layers import UpSampling2D
+from keras.layers import Flatten
 from keras.models import Model
 from keras.layers import Input
 from keras.layers import Dense
@@ -29,22 +33,55 @@ class HairColorizationTraining:
         mask_inputs = Input(shape=(self.img_h, self.img_w, 1,))
         hue_inputs = Input(shape=(1,))
 
-        # encoder
         encoder_layers = [
             Conv2D(64, (3,3), activation='relu', padding='same', strides=2),
             Conv2D(128, (3,3), activation='relu', padding='same'),
+            Conv2D(128, (3,3), activation='relu', padding='same'),
+            Conv2D(128, (3,3), activation='relu', padding='same'),
+            Conv2D(128, (3,3), activation='relu', padding='same'),
+            Conv2D(128, (3,3), activation='relu', padding='same'),
             Conv2D(128, (3,3), activation='relu', padding='same', strides=2),
+            Conv2D(256, (3,3), activation='relu', padding='same'),
+            Conv2D(256, (3,3), activation='relu', padding='same'),
+            Conv2D(256, (3,3), activation='relu', padding='same'),
+            Conv2D(256, (3,3), activation='relu', padding='same'),
             Conv2D(256, (3,3), activation='relu', padding='same'),
             Conv2D(256, (3,3), activation='relu', padding='same', strides=2),
             Conv2D(512, (3,3), activation='relu', padding='same'),
             Conv2D(512, (3,3), activation='relu', padding='same'),
+            Conv2D(512, (3,3), activation='relu', padding='same'),
+            Conv2D(512, (3,3), activation='relu', padding='same'),
+            Conv2D(512, (3,3), activation='relu', padding='same'),
+            Conv2D(512, (3,3), activation='relu', padding='same', strides=2),
+            Conv2D(256, (3,3), activation='relu', padding='same'),
+            Conv2D(256, (3,3), activation='relu', padding='same'),
+            Conv2D(256, (3,3), activation='relu', padding='same'),
+            Conv2D(256, (3,3), activation='relu', padding='same'),
             Conv2D(256, (3,3), activation='relu', padding='same'),
         ]
+
         decoder_layers = [
+            Conv2D(256, (3,3), activation='relu', padding='same'),
+            Conv2D(256, (3,3), activation='relu', padding='same'),
+            Conv2D(256, (3,3), activation='relu', padding='same'),
+            Conv2D(256, (3,3), activation='relu', padding='same'),
+            Conv2D(256, (3,3), activation='relu', padding='same'),
+            UpSampling2D((2, 2)),
+            Conv2D(128, (3,3), activation='relu', padding='same'),
+            Conv2D(128, (3,3), activation='relu', padding='same'),
+            Conv2D(128, (3,3), activation='relu', padding='same'),
+            Conv2D(128, (3,3), activation='relu', padding='same'),
             Conv2D(128, (3,3), activation='relu', padding='same'),
             UpSampling2D((2, 2)),
             Conv2D(64, (3,3), activation='relu', padding='same'),
+            Conv2D(64, (3,3), activation='relu', padding='same'),
+            Conv2D(64, (3,3), activation='relu', padding='same'),
+            Conv2D(64, (3,3), activation='relu', padding='same'),
+            Conv2D(64, (3,3), activation='relu', padding='same'),
             UpSampling2D((2, 2)),
+            Conv2D(32, (3,3), activation='relu', padding='same'),
+            Conv2D(32, (3,3), activation='relu', padding='same'),
+            Conv2D(32, (3,3), activation='relu', padding='same'),
             Conv2D(32, (3,3), activation='relu', padding='same'),
             Conv2D(16, (3,3), activation='relu', padding='same'),
             Conv2D(3, (3, 3), activation='tanh', padding='same'),
@@ -64,13 +101,15 @@ class HairColorizationTraining:
         for layer in decoder_layers:
             decoder_output = layer(decoder_output)
 
-        def image_loss(y_true, y_pred):
-            return tf.norm(y_true - y_pred)
+        assert decoder_output.shape == inputs.shape,\
+            "decoder_output shape is {0}, while inputs shape is {1}. They should be the same!"\
+            .format(decoder_output.shape, inputs.shape)
 
         # tie it together [image, seq] [word]
         self.model = Model(inputs=[inputs, mask_inputs, hue_inputs], outputs=decoder_output)
         self.model.compile(
-            loss=[image_loss], optimizer='adam', metrics=['acc']
+            optimizer=Adam(learning_rate=0.0001), loss=categorical_crossentropy,
+            metrics=['accuracy']
         )
         # summarize model
         print(self.model.summary())
@@ -84,31 +123,81 @@ class HairColorizationTraining:
         )
         steps_per_epoch = np.uint8(np.floor(num_train_samples / batch_size))
 
-        self.fit_history = self.model.fit(dataset, epochs=3, steps_per_epoch=steps_per_epoch, verbose=1)
+        self.fit_history = self.model.fit(dataset, epochs=10, steps_per_epoch=steps_per_epoch, verbose=2)
 
         self.model.save('model_merge.h5')
 
 def preprocess_image(img_h, img_w, img, gray_img, b_mask):
-    window_left_top_y, window_left_top_x = img.shape[0], img.shape[1]
-    window_right_bottom_y, window_right_bottom_x = 0, 0
+    assert img_h / img_w == img.shape[0] / img.shape[1],\
+        "the requested width/height ratio must be the same as ratio in the original image."
+    assert img_h < img.shape[0],\
+        "the requested width/height must be smaller than the original image."
+    window_top_left_y, window_top_left_x = img.shape[0], img.shape[1]
+    window_bottom_right_y, window_bottom_right_x = 0, 0
+    ll = 1
     for y, mask_y in enumerate(b_mask):
         for x, mask in enumerate(mask_y):
             if mask.any():
-                window_left_top_y = min(window_left_top_y, y)
-                window_left_top_x = min(window_left_top_x, x)
-                window_right_bottom_y = max(window_right_bottom_y, y)
-                window_right_bottom_x = max(window_right_bottom_x, x)
+                window_top_left_y = min(window_top_left_y, y)
+                window_top_left_x = min(window_top_left_x, x)
+                window_bottom_right_y = max(window_bottom_right_y, y)
+                window_bottom_right_x = max(window_bottom_right_x, x)
 
-    expected_img = img[window_left_top_y:window_right_bottom_y + 1,window_left_top_x: window_right_bottom_x + 1][:]
+    log(ll, "before window_top_left_y: {0}", window_top_left_y)
+    log(ll, "before window_top_left_x: {0}", window_top_left_x)
+    log(ll, "before window_bottom_right_y: {0}", window_bottom_right_y)
+    log(ll, "before window_bottom_right_x: {0}", window_bottom_right_x)
+
+    # Keep the ratio of the window
+    window_size = [window_bottom_right_y - window_top_left_y, window_bottom_right_x - window_top_left_x]
+    window_center = [window_top_left_y + window_size[0] / 2, window_top_left_x + window_size[1] / 2]
+    expected_image_size_ratio = img_h / img_w
+    log(ll, "img shape: {0}", img.shape)
+    log(ll, "expected_image_size_ratio: {0}", expected_image_size_ratio)
+    log(ll, "before window_size: {0}", window_size)
+    log(ll, "before window_center: {0}", window_center)
+    if window_size[0] > window_size[1]:
+        new_half_size_1 = (window_size[0] / expected_image_size_ratio) / 2
+        window_size[1] = window_size[0] / expected_image_size_ratio
+        if window_center[1] + new_half_size_1 >= img.shape[1]:
+            window_center[1] = img.shape[1] - new_half_size_1 - 1
+        elif window_center[1] - new_half_size_1 < 0:
+            window_center[1] = new_half_size_1
+    else:
+        new_half_size_0 = (window_size[1] * expected_image_size_ratio) / 2
+        window_size[0] = window_size[1] * expected_image_size_ratio
+        if window_center[0] + new_half_size_0 >= img.shape[0]:
+            window_center[0] = img.shape[0] - new_half_size_0 - 1
+        elif window_center[0] - new_half_size_0 < 0:
+            window_center[0] = new_half_size_0
+
+    log(ll, "after window_size: {0}", window_size)
+    log(ll, "after window_center: {0}", window_center)
+
+    # Apply the adjusted window to the ratio
+    window_top_left_y = int(window_center[0] - (window_size[0] // 2))
+    window_top_left_x = int(window_center[1] - (window_size[1] // 2))
+    window_bottom_right_y = int(window_center[0] + (window_size[0] // 2))
+    window_bottom_right_x = int(window_center[1] + (window_size[1] // 2))
+
+    log(ll, "after window_top_left_y: {0}", window_top_left_y)
+    log(ll, "after window_top_left_x: {0}", window_top_left_x)
+    log(ll, "after window_bottom_right_y: {0}", window_bottom_right_y)
+    log(ll, "after window_bottom_right_x: {0}", window_bottom_right_x)
+
+    expected_img = img[window_top_left_y:window_bottom_right_y + 1,window_top_left_x: window_bottom_right_x + 1][:]
     processed_img = expected_img.copy()
-    mask_shape = (window_right_bottom_y - window_left_top_y + 1, window_right_bottom_x - window_left_top_x + 1, 1)
+    mask_shape = (window_bottom_right_y - window_top_left_y + 1, window_bottom_right_x - window_top_left_x + 1, 1)
     processed_mask = np.zeros(mask_shape, np.uint8)
+    log(ll, "expected_img shape: {0}", expected_img.shape)
+    log(ll, "processed_img shape: {0}", processed_img.shape)
+    log(ll, "processed_mask shape: {0}", processed_mask.shape)
 
-    for y in range(window_left_top_y, window_right_bottom_y + 1):
-        for x in range(window_left_top_x, window_right_bottom_x + 1):
+    for y in range(window_top_left_y, window_bottom_right_y + 1):
+        for x in range(window_top_left_x, window_bottom_right_x + 1):
             if b_mask[y][x].any():
-                processed_img[y - window_left_top_y][x - window_left_top_x] = gray_img[y][x]
-                processed_mask[y - window_left_top_y][x - window_left_top_x] = [255]
+                processed_img[y - window_top_left_y][x - window_top_left_x] = gray_img[y][x]
+                processed_mask[y - window_top_left_y][x - window_top_left_x] = [255]
 
     processed_img = cv.resize(processed_img, (img_h, img_w), interpolation= cv.INTER_LINEAR)
     processed_mask = cv.resize(processed_mask, (img_h, img_w), interpolation= cv.INTER_LINEAR)
