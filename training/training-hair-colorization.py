@@ -317,6 +317,7 @@ def preprocess_image(img_h, img_w, img, gray_img, b_mask):
 def predict(image_path, hue, output_dir, model_path=model_path):
     import importlib
     import sys
+    ## TODO FIXME!! should not depend on another package
     predictor_path = path.abspath(dir_path + f'/../../hair-segment/replicate')
     sys.path.append(predictor_path)
     segment_mod = importlib.import_module('hair_segment_predictor')

@@ -2,7 +2,6 @@
  nixpkgs ? import <nixpkgs> { },
  pkgs ? nixpkgs.pkgs
 }:
-with pkgs;
 let
 
   namex = with pkgs; with pkgs.python3.pkgs; buildPythonPackage rec {
@@ -153,7 +152,7 @@ let
     ];
   };
 
-  pythonEnv = python3.withPackages (p: with p; [
+  pythonEnv = pkgs.python3.withPackages (p: with p; [
     virtualenv
     ipykernel
     py-cpuinfo
@@ -162,7 +161,6 @@ let
     numpy
     pydot
     graphviz
-    pipreqs
     gradient 
     torch
     torchvision
@@ -188,6 +186,7 @@ let
 
   nativeBuildInputs = with pkgs; [
     unzip
+    pipreqs
     git
     stdenv.cc.cc
     pythonEnv
