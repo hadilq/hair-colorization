@@ -23,13 +23,16 @@ import math
 import json
 import cv2 as cv
 
+dir_path = os.path.dirname(os.path.realpath(__file__))
+model_path = dir_path + f'model_merge.h5'
+
 class HairColorizationTraining:
 
     def __init__(self, img_h, img_w):
         self.img_h, self.img_w = img_h, img_w
 
     def define_model(self):
-        inputs = Input(shape=(self.img_h, self.img_w, 3,))
+        img_inputs = Input(shape=(self.img_h, self.img_w, 3,))
         mask_inputs = Input(shape=(self.img_h, self.img_w, 1,))
         hue_inputs = Input(shape=(1,))
 
@@ -88,7 +91,7 @@ class HairColorizationTraining:
             UpSampling2D((2, 2)),
         ]
 
-        encoder_output = Concatenate(axis = 3)([inputs, mask_inputs])
+        encoder_output = Concatenate(axis = 3)([img_inputs, mask_inputs])
         for layer in encoder_layers:
             concat_shape = (np.uint32(encoder_output.shape[1]), np.uint32(encoder_output.shape[2]), np.uint32(hue_inputs.shape[-1]))
 
@@ -101,19 +104,19 @@ class HairColorizationTraining:
         for layer in decoder_layers:
             decoder_output = layer(decoder_output)
 
-        assert decoder_output.shape == inputs.shape,\
+        assert decoder_output.shape == img_inputs.shape,\
             "decoder_output shape is {0}, while inputs shape is {1}. They should be the same!"\
-            .format(decoder_output.shape, inputs.shape)
+            .format(decoder_output.shape, img_inputs.shape)
 
         # tie it together [image, seq] [word]
-        self.model = Model(inputs=[inputs, mask_inputs, hue_inputs], outputs=decoder_output)
+        self.model = Model(inputs=[img_inputs, mask_inputs, hue_inputs], outputs=decoder_output)
         self.model.compile(
             optimizer=Adam(learning_rate=0.0001), loss=categorical_crossentropy,
             metrics=['accuracy']
         )
         # summarize model
-        print(self.model.summary())
-        # plot_model(self.model, to_file='autoencoder_colorization_merged.png', show_shapes=True)
+        self.model.summary()
+        # plot_model(self.model, to_file=dir_path + f'/autoencoder_colorization.png', show_shapes=True)
 
     def train(self, image_dir, data_dir, num_train_samples, batch_size, **kwargs):
         dataset = HairColorizationPyDataset(
@@ -125,7 +128,109 @@ class HairColorizationTraining:
 
         self.fit_history = self.model.fit(dataset, epochs=10, steps_per_epoch=steps_per_epoch, verbose=2)
 
-        self.model.save('model_merge.h5')
+        self.model.save(model_path)
+
+class HairColorizationPyDataset(PyDataset):
+
+    def __init__(
+        self,
+        image_dir,
+        data_dir,
+        num_train_samples,
+        batch_size,
+        img_h, img_w,
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+        assert batch_size % 4 == 0, "batch_size must always be divisible to 4."
+        self.data_list = glob.glob(path.abspath(data_dir) + f'/*.json')
+        assert 4 * len(self.data_list) >= num_train_samples, "len of data_list: {0}, num_train_samples: {1}".format(self.data_list, num_train_samples)
+        self.image_dir, self.data_dir = path.abspath(image_dir), path.abspath(data_dir)
+        self.num_train_samples, self.batch_size = num_train_samples, batch_size
+        self.img_h, self.img_w = img_h, img_w
+
+    def __len__(self):
+        # return number of batches.
+        return math.ceil(self.num_train_samples / self.batch_size)
+
+    def __getitem__(self, idx):
+        data_idx = idx * self.batch_size // 4
+        ll = 2
+
+        true_img_list, processed_img_list, mask_list, hue_list = list(), list(), list(), list()
+        while len(processed_img_list) < self.batch_size and data_idx < len(self.data_list):
+            json_path = self.data_list[data_idx]
+            data_idx += 1
+            json_name = path.basename(json_path)
+            splitted_name = path.splitext(json_name)
+            image_name = splitted_name[0] + '.jpg'
+            gray_name = splitted_name[0] + '-gray-hair.jpg'
+            b_mask_name = splitted_name[0] + '-b-mask.png'
+            image_path = os.path.join(self.image_dir, image_name)
+            gray_path = os.path.join(self.data_dir, gray_name)
+            b_mask_path = os.path.join(self.data_dir, b_mask_name)
+
+            hues = []
+            with open(json_path, 'r') as f:
+                try:
+                    data = json.loads(f.read())
+                    hues.append(data['min_hue'])
+                    hues.append(data['max_hue'])
+                    hues.append(data['mean_hue'])
+                    hues.append(data['median_hue'])
+                except json.jsondecodeerror as e:
+                    log(3,)
+                    raise "cannot parse: {0}, {1}".format(json_path, e)
+            assert(len(hues) == 4)
+
+            img = cv.imread(image_path)
+            if img is None:
+                raise "cannot parse: {0}".format(image_path)
+
+            gray_img = cv.imread(gray_path)
+            if gray_img is None:
+                log(3, )
+                raise "cannot parse gray image: {0}".format(gray_path)
+
+            b_mask = cv.imread(b_mask_path)
+            if b_mask is None:
+                log(3, )
+                raise "cannot parse b-mask: {0}".format(b_mask_path)
+
+            processed_img, processed_mask, true_img = preprocess_image(
+                self.img_h, self.img_w, img, gray_img, b_mask
+            )
+
+            for hue in hues:
+                hue_list.append(hue)
+                processed_img_list.append(processed_img.copy())
+                mask_list.append(processed_mask.copy())
+                true_img_list.append(true_img.copy())
+
+            log(ll, "len processed_img_list: {0}", len(processed_img_list))
+            log(ll, "image_name: {0}", image_name)
+            log(ll, "processed_img shape: {0}", processed_img.shape)
+            log(ll, "processed_mask shape: {0}", processed_mask.shape)
+            log(ll, "true_img shape: {0}", true_img.shape)
+
+        processed_img_list = np.array(processed_img_list)
+        mask_list = np.array(mask_list)
+        hue_list = np.array(hue_list)
+        true_img_list = np.array(true_img_list)
+        log(ll, "processed_img_list shape: {0}", processed_img_list.shape)
+        log(ll, "mask_list shape: {0}", mask_list.shape)
+        log(ll, "hue_list shape: {0}", hue_list.shape)
+        log(ll, "img_true_list shape: {0}", true_img_list.shape)
+        log(ll, "idx: {0}", idx)
+        log(ll, "data_idx: {0}", data_idx)
+        log(ll, "len data_list: {0}", len(self.data_list))
+        assert processed_img_list.shape[0] != 0,\
+                "processed_img_list is empty! __len__: {0}, len data_list: {1}, current_idx: {2}, idx: {3}"\
+                .format(self.__len__(), len(self.data_list), data_idx, idx)
+        return (
+            (processed_img_list, mask_list, hue_list),
+            true_img_list,
+        )
 
 def preprocess_image(img_h, img_w, img, gray_img, b_mask):
     assert img_h / img_w == img.shape[0] / img.shape[1],\
@@ -209,99 +314,26 @@ def preprocess_image(img_h, img_w, img, gray_img, b_mask):
     log(1, "expected_img shape: {0}", expected_img.shape)
     return processed_img, processed_mask, expected_img
 
-class HairColorizationPyDataset(PyDataset):
-
-    def __init__(
-        self,
-        image_dir,
-        data_dir,
-        num_train_samples,
-        batch_size,
-        img_h, img_w,
-        **kwargs
-    ):
-        super().__init__(**kwargs)
-        assert batch_size % 4 == 0, "batch_size must always be divisible to 4."
-        self.data_list = glob.glob(path.abspath(data_dir) + f'/*.json')
-        assert len(self.data_list) >= num_train_samples, "len of data_list: {0}, num_train_samples: {1}".format(self.data_list, num_train_samples)
-        self.image_dir, self.data_dir = path.abspath(image_dir), path.abspath(data_dir)
-        self.num_train_samples, self.batch_size = num_train_samples, batch_size
-        self.img_h, self.img_w = img_h, img_w
-        self.current_idx = 0
-
-    def __len__(self):
-        # Return number of batches.
-        return math.ceil(self.num_train_samples / self.batch_size)
-
-    def __getitem__(self, idx):
-        data_list = self.data_list[self.current_idx:]
-
-        true_img_list, processed_img_list, mask_list, hue_list = list(), list(), list(), list()
-        for json_path in data_list:
-            json_name = path.basename(json_path)
-            splitted_name = path.splitext(json_name)
-            image_name = splitted_name[0] + '.jpg'
-            gray_name = splitted_name[0] + '-gray-hair.jpg'
-            b_mask_name = splitted_name[0] + '-b-mask.png'
-            image_path = os.path.join(self.image_dir, image_name)
-            gray_path = os.path.join(self.data_dir, gray_name)
-            b_mask_path = os.path.join(self.data_dir, b_mask_name)
-
-            hues = []
-            with open(json_path, 'r') as f:
-                try:
-                    data = json.loads(f.read())
-                    hues.append(data['min_hue'])
-                    hues.append(data['max_hue'])
-                    hues.append(data['mean_hue'])
-                    hues.append(data['median_hue'])
-                except json.JSONDecodeError as e:
-                    log(2, "cannot parse: {0}, {1}", json_path, e)
-                    continue
-            assert(len(hues) == 4)
-
-            img = cv.imread(image_path)
-            if img is None:
-                log(2, "cannot parse image: {0}", image_path)
-                continue
-
-            gray_img = cv.imread(gray_path)
-            if gray_img is None:
-                log(2, "cannot parse gray image: {0}", gray_path)
-                continue
-
-            b_mask = cv.imread(b_mask_path)
-            if b_mask is None:
-                log(2, "cannot parse b-mask: {0}", b_mask_path)
-                continue
-
-            processed_img, processed_mask, true_img = preprocess_image(
-                self.img_h, self.img_w, img, gray_img, b_mask
-            )
-
-            for hue in hues:
-                hue_list.append(hue)
-                processed_img_list.append(processed_img.copy())
-                mask_list.append(processed_mask.copy())
-                true_img_list.append(true_img.copy())
-
-            self.current_idx += 1
-            if len(processed_img_list) >= self.batch_size:
-                break
-
-        processed_img_list = np.array(processed_img_list)
-        mask_list = np.array(mask_list)
-        hue_list = np.array(hue_list)
-        true_img_list = np.array(true_img_list)
-        log(2, "processed_img_list shape: {0}", processed_img_list.shape)
-        log(2, "mask_list shape: {0}", mask_list.shape)
-        log(2, "hue_list shape: {0}", hue_list.shape)
-        log(2, "img_true_list shape: {0}", true_img_list.shape)
-        return (
-            (processed_img_list, mask_list, hue_list),
-            true_img_list,
-        )
-
+def predict(image_path, hue, output_dir, model_path=model_path):
+    import importlib
+    import sys
+    predictor_path = path.abspath(dir_path + f'/../../hair-segment/replicate')
+    sys.path.append(predictor_path)
+    segment_mod = importlib.import_module('hair_segment_predictor')
+    hair_segment_predictor = segment_mod.HairSegmentPredictor()
+    img, b_mask, _ = segment_mod.make_data(image_path)
+    if img is None:
+        log(3, "cannot make data!")
+        return None
+    gray_img = segment_mod.make_gray_hair(img, b_mask)
+    processed_img, processed_mask, _ = preprocess_image(
+            240, 240, img, gray_img, b_mask
+    )
+    model = tf.keras.models.load_model(model_path)
+    return model.predict(
+        { 'img': processed_img, 'mask': processed_mask, 'hue': hue },
+        verbose = 2
+    )
 
 def log(level, s, *arg):
      if level > 2:
