@@ -60,11 +60,11 @@ let
 
     disabled = pythonOlder "3.9";
 
-    src = fetchPypi {
+    src = fetchPypi rec {
       inherit pname version format;
       hash = "sha256-kwxhEAzOOly2PTD+Z3ZQRAUhToOYomypaCIuy4uPlAQ=";
       dist = python;
-      python = "cp311";
+      python = abi;
       abi = "cp311";
       platform = "manylinux_2_17_x86_64.manylinux2014_x86_64";
     };
