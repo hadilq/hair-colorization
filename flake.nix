@@ -6,7 +6,11 @@
 
   outputs = args@{ self, nixpkgs, flake-utils }:
     flake-utils.lib.eachDefaultSystem (system:
-      let pkgs = nixpkgs.legacyPackages.${system}; in
+      let
+        pkgs = import nixpkgs {
+          inherit system; config.allowUnfree = true; config.cudaSupport = true;
+        };
+      in
       {
         devShells.default = import ./shell.nix { inherit nixpkgs pkgs; };
       }

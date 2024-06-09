@@ -1,6 +1,8 @@
 {
- nixpkgs ? import <nixpkgs> { },
- pkgs ? nixpkgs.pkgs
+  nixpkgs ? import <nixpkgs> {
+    config.allowUnfree = true; config.cudaSupport = true;
+  },
+  pkgs ? nixpkgs.pkgs
 }:
 let
 
@@ -76,6 +78,7 @@ let
 
     nativeBuildInputs = [
       inputsEnv
+      pkgs.cudatoolkit
     ];
   };
 
@@ -189,6 +192,7 @@ let
     pipreqs
     git
     stdenv.cc.cc
+    cudatoolkit
     pythonEnv
   ];
 
