@@ -78,7 +78,6 @@ let
 
     nativeBuildInputs = [
       inputsEnv
-      pkgs.cudatoolkit
     ];
   };
 
@@ -192,7 +191,6 @@ let
     pipreqs
     git
     stdenv.cc.cc
-    cudatoolkit
     pythonEnv
   ];
 
