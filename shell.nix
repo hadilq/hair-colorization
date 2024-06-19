@@ -1,6 +1,6 @@
 {
   nixpkgs ? import <nixpkgs> {
-    config.allowUnfree = true; config.cudaSupport = true;
+    config.allowUnfree = true; #config.cudaSupport = true;
   },
   pkgs ? nixpkgs.pkgs
 }:
@@ -155,7 +155,6 @@ let
   };
 
   pythonEnv = pkgs.python3.withPackages (p: with p; [
-    virtualenv
     ipykernel
     py-cpuinfo
     typing-extensions
@@ -186,7 +185,9 @@ let
     ultralytics-thop
   ]);
 
-  nativeBuildInputs = with pkgs; [
+  buildInputs = with pkgs; [
+    python312Packages.venvShellHook
+    autoPatchelfHook
     unzip
     pipreqs
     git
@@ -194,16 +195,47 @@ let
     pythonEnv
   ];
 
+  venvDir = "./.venv";
 in
 pkgs.mkShell {
   name = "colorization";
 
-  buildInputs = nativeBuildInputs;
+  inherit buildInputs venvDir;
+
+  propagatedBuildInputs = [
+    pkgs.stdenv.cc.cc.lib
+  ];
+
+  LANG = "en_US.UTF-8";
 
   shellHook = ''
-    export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath [
-      pkgs.stdenv.cc.cc
-    ]}
+    if [[ -d "${venvDir}" ]]; then
+      echo "Skipping venv creation, '${venvDir}' already exists"
+      source "${venvDir}/bin/activate"
+    else
+      echo "Creating new venv environment in path: '${venvDir}'"
+      python -m venv "${venvDir}"
+
+      find ${pythonEnv}/bin -mindepth 1 -maxdepth 1 -not -name python | while read i
+      do
+          ln -s $i ${venvDir}/bin
+      done
+
+      find ${pythonEnv}/include -mindepth 1 -maxdepth 1 | while read i
+      do
+          ln -s $i ${venvDir}/include
+      done
+
+      find ${pythonEnv}/lib -mindepth 1 -maxdepth 1 | while read i
+      do
+          ln -s $i ${venvDir}/lib
+      done
+
+      source "${venvDir}/bin/activate"
+    fi
+
+    export SITE=${pythonEnv}
+
     # Gradiant API KEY is in .env
     source .env
   '';
