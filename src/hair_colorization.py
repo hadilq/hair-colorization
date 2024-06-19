@@ -1,5 +1,6 @@
 import tensorflow as tf
 from keras.optimizers import Adam
+from keras.optimizers import SGD
 from keras.layers import Conv2D
 from keras.layers import MaxPooling2D
 from keras.layers import UpSampling2D
@@ -108,9 +109,7 @@ class HairColorization:
             .format(decoder_output.shape, img_inputs.shape)
 
         self.model = Model(inputs=[img_inputs, hue_inputs], outputs=decoder_output)
-        self.model.compile(
-            optimizer=Adam(learning_rate=0.0001), loss='mean_squared_error'
-        )
+        self.compile_model()
         # summarize model
         self.model.summary()
 
@@ -126,7 +125,7 @@ class HairColorization:
         dataset = HairColorizationPyDataset(
             image_dir, output_dir, data_dir, num_train_samples, batch_size,
             self.img_h, self.img_w,
-             self.preprocess_image,
+            self.preprocess_image,
             **kwargs
         )
 
@@ -142,11 +141,10 @@ class HairColorization:
             self.save_model(model_path, index)
             index += 1
 
-            #max_accuracy = max(self.fit_history.history.get('accuracy'))
-            #log(3, "accuracy: {0}", max_accuracy)
-            mean_squared_error = max(self.fit_history.history.get('mean_squared_error'))
-            log(3, "mean_squared_error : {0}", mean_squared_error)
-            if mean_squared_error < 10:
+            log(3, "history: {0}", self.fit_history.history)
+            max_accuracy = max(self.fit_history.history.get('accuracy'))
+            log(3, "accuracy: {0}", max_accuracy)
+            if max_accuracy > 0.95:
                 break
 
     def save_model(self, model_path, index):
@@ -159,28 +157,40 @@ class HairColorization:
         self.model.save(indexed_model_path)
 
     def load_model(self, model_path=model_path):
-        self.model = tf.keras.models.load_model(
-            model_path,
-            custom_objects={ 'loss': 'mean_squared_error' }
+        self.model = tf.keras.models.load_model(model_path, compile=False)
+        self.compile_model()
+    
+
+    def compile_model(self):
+        self.model.compile(
+            #optimizer=Adam(learning_rate=0.0001),
+            optimizer=SGD(
+                learning_rate=10.0
+            ),
+            loss='mean_squared_error',
+            metrics=['accuracy']
         )
 
     def predict(self, img, b_mask, gray_img, hue, output_dir):
-        import importlib
         if img is None:
             log(3, "cannot make data!")
             return None
-        processed_img, _, window = self.preprocess_image(
-                img, gray_img, b_mask, output_dir
+        processed_img, true_img, window = self.preprocess_image(
+                img, hue, gray_img, b_mask, output_dir
         )
+        logImage(3, output_dir, processed_img)
+        logImage(3, output_dir, true_img)
         prediction = self.model.predict(
             (( np.array([ processed_img ]),
                np.array([ hue ])
               )),
             verbose = 2
         )
-        return self.postprocess_image(img, (prediction[0]).astype(np.uint8), window)
+        return self.postprocess_image(
+            img, (prediction[0]).astype(np.uint8), b_mask, window
+        )
 
-    def postprocess_image(self, img, prediction, window):
+    def postprocess_image(self, img, prediction, b_mask, window):
         window_top_left_y, window_top_left_x,\
             window_bottom_right_y, window_bottom_right_x = window
         window_size = (
@@ -196,15 +206,19 @@ class HairColorization:
         )
         for y in range(window_top_left_y, window_bottom_right_y):
             for x in range(window_top_left_x, window_bottom_right_x):
-                postprocess_image[y][x] = processed_img[y - window_top_left_y][x - window_top_left_x]
+                if b_mask[y][x].any():
+                    postprocess_image[y][x] = processed_img[y - window_top_left_y][x - window_top_left_x]
 
         return postprocess_image
 
-    def preprocess_image(self, img, gray_img, b_mask, output_dir):
+    def preprocess_image(self, img, requested_hue, gray_img, b_mask, output_dir):
         assert self.img_h / self.img_w == img.shape[0] / img.shape[1],\
             "the requested width/height ratio must be the same as ratio in the original image."
         assert self.img_h < img.shape[0],\
             "the requested width/height must be smaller than the original image."
+        requested_rgb_color = cv.cvtColor(
+            np.array([[[requested_hue, 255, 255]]], dtype = np.uint8), cv.COLOR_HSV2RGB
+        )[0][0]
         window_top_left_y, window_top_left_x = img.shape[0], img.shape[1]
         window_bottom_right_y, window_bottom_right_x = 0, 0
         ll = 1
@@ -259,6 +273,7 @@ class HairColorization:
         log(ll, "after window_bottom_right_x: {0}", window_bottom_right_x)
 
         expected_img = img[window_top_left_y:window_bottom_right_y + 1,window_top_left_x: window_bottom_right_x + 1][:]
+        expected_img = expected_img.copy()
         processed_img = expected_img.copy()
         mask_shape = (window_bottom_right_y - window_top_left_y + 1, window_bottom_right_x - window_top_left_x + 1, 1)
         log(ll, "expected_img shape: {0}", expected_img.shape)
@@ -270,9 +285,9 @@ class HairColorization:
                     processed_img[y - window_top_left_y][x - window_top_left_x] = gray_img[y][x]
                 else:
                     processed_img[y - window_top_left_y][x - window_top_left_x] =\
-                        np.array([0, 0, 0], dtype = np.uint8)
+                        requested_rgb_color
                     expected_img[y - window_top_left_y][x - window_top_left_x] =\
-                        np.array([0, 0, 0], dtype = np.uint8)
+                        requested_rgb_color
 
         processed_img = cv.resize(processed_img, (self.img_h, self.img_w), interpolation= cv.INTER_LINEAR)
         expected_img = cv.resize(expected_img, (self.img_h, self.img_w), interpolation= cv.INTER_LINEAR)
@@ -329,6 +344,8 @@ class HairColorizationPyDataset(PyDataset):
         true_img_list, processed_img_list, hue_list = list(), list(), list()
         while len(processed_img_list) < self.batch_size and data_idx < len(self.data_list):
             json_path = self.data_list[data_idx]
+            data_idx += 1
+
             hues = []
             with open(json_path, 'r') as f:
                 try:
@@ -338,34 +355,43 @@ class HairColorizationPyDataset(PyDataset):
                     hues.append(data['mean_hue'])
                     hues.append(data['median_hue'])
                 except json.JSONDecodeError as e:
-                    log(3,)
                     raise "cannot parse: {0}, {1}".format(json_path, e)
             # This is how we define the self.sample_expansion_rate
             assert(len(hues) == self.sample_expansion_rate)
 
-            data_idx += 1
             json_name = path.basename(json_path)
             splitted_name = path.splitext(json_name)
-            processed_img_name = splitted_name[0] + '-processed-img.jpg'
-            true_img_name = splitted_name[0] + '-true-img.jpg'
-            processed_img_path = os.path.join(self.data_dir, processed_img_name)
-            true_img_path = os.path.join(self.data_dir, true_img_name)
+            processed_img_path_list, true_img_path_list = list(), list()
+            all_caches_exist = True
+            for i in range(len(hues)):
+                processed_img_name = splitted_name[0] + '-processed-img-cache.' + str(i) + '.jpg'
+                true_img_name = splitted_name[0] + '-true-img-cache.' + str(i) + '.jpg'
+                processed_img_path = os.path.join(self.data_dir, processed_img_name)
+                true_img_path = os.path.join(self.data_dir, true_img_name)
+                processed_img_path_list.append(processed_img_path)
+                true_img_path_list.append(true_img_path)
+                all_caches_exist = all_caches_exist and os.path.exists(processed_img_path)\
+                    and os.path.exists(true_img_path)
 
-            if os.path.exists(processed_img_path) and os.path.exists(true_img_path):
-                processed_img = cv.imread(processed_img_path)
-                true_img = cv.imread(true_img_path)
-                if processed_img is not None and true_img is not None:
-                    firstIteration = True
-                    for hue in hues:
-                        hue_list.append(hue)
-                        if firstIteration:
-                            processed_img_list.append(processed_img)
-                            true_img_list.append(true_img)
-                            firstIteration = False
-                        else:
-                            processed_img_list.append(processed_img.copy())
-                            true_img_list.append(true_img.copy())
-                    continue
+            if all_caches_exist:
+                for i in range(len(hues)):
+                    processed_img_path = processed_img_path_list[i]
+                    true_img_path = true_img_path_list[i]
+                    processed_img = cv.imread(processed_img_path)
+                    true_img = cv.imread(true_img_path)
+                    if processed_img is not None and true_img is not None:
+                        hue_list.append(hues[i])
+                        processed_img_list.append(processed_img)
+                        true_img_list.append(true_img)
+                    else:
+                        if processed_img is None:
+                            log(4, "cannot read the processed_img cache! {0}", processed_img_path)
+                        if true_img is None:
+                            log(4, "cannot read the true_img cache! {0}", true_img_path)
+                        raise "couldn't read cache file! {0}, {1}".format(processed_img_path, true_img_path)
+                continue
+            else:
+                log(4, "No cache for {0}!", json_path)
 
             image_name = splitted_name[0] + '.jpg'
             gray_name = splitted_name[0] + '-gray-hair.jpg'
@@ -389,17 +415,22 @@ class HairColorizationPyDataset(PyDataset):
                 log(3, )
                 raise "cannot parse b-mask: {0}".format(b_mask_path)
 
-            processed_img, true_img, _ = self.preprocess_image(
-                img, gray_img, b_mask, self.output_dir
-            )
+            for i in range(len(hues)):
+                hue = hues[i]
+                processed_img, true_img, _ = self.preprocess_image(
+                    img, hue, gray_img, b_mask, self.output_dir
+                )
 
-            cv.imwrite(processed_img_path, processed_img)
-            cv.imwrite(true_img_path, true_img)
+                processed_img_path = processed_img_path_list[i]
+                true_img_path = true_img_path_list[i]
+                log(ll, "processed_img_path: {0}", processed_img_path)
+                log(ll, "true_img_path: {0}", true_img_path)
+                cv.imwrite(processed_img_path, processed_img)
+                cv.imwrite(true_img_path, true_img)
 
-            for hue in hues:
                 hue_list.append(hue)
-                processed_img_list.append(processed_img.copy())
-                true_img_list.append(true_img.copy())
+                processed_img_list.append(processed_img)
+                true_img_list.append(true_img)
 
             log(ll, "len processed_img_list: {0}", len(processed_img_list))
             log(ll, "image_name: {0}", image_name)
