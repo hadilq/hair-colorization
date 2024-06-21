@@ -164,7 +164,6 @@ class HairSegment:
     def make_dataset(self, input_dir, output_dir):
         import glob
         import json
-        from PIL import Image as Img
         for image_path in glob.glob(os.path.abspath(input_dir) + '/*.jpg'):
             log(3, "image_path: {0}", image_path)
             image_name = os.path.basename(image_path)
@@ -186,8 +185,8 @@ class HairSegment:
             with open(data_output_path, 'w') as f:
                 json.dump(data, f)
             gray_img = self.make_gray_hair(img, b_mask)
-            Img.fromarray(gray_img).save(gray_output_path)
-            Img.fromarray(b_mask).save(b_mask_output_path)
+            cv.imwrite(gray_output_path, cv.cvtColor(gray_img, cv.COLOR_GRAY2BGR))
+            cv.imwrite(b_mask_output_path, b_mask)
 
     def make_data(self, image_path):
         img, b_mask = self.find_mask(image_path)
@@ -226,11 +225,25 @@ class HairSegment:
             median_hue = np.uint8(sample_in_hue[len(sample_in_hue) // 2 + 1])
 
         mean_hue = np.uint8(np.floor(mean_hue))
+        mode_hue = np.uint8(0)
+        last_hue = np.uint8(-1)
+        count = 0
+        max_count = 0
+        for hue in sample_in_hue:
+            if hue == last_hue:
+                count += 1
+            else:
+                last_hue = hue
+            if count > max_count:
+                max_count = count
+                mode_hue = hue
+
         data = {
             'min_hue': min_hue.item(),
             'max_hue': max_hue.item(),
             'mean_hue': mean_hue.item(),
-            'median_hue': median_hue.item()
+            'median_hue': median_hue.item(),
+            'mode_hue': mode_hue.item()
         }
         log(3, "data: {0}", data)
         return img, b_mask, data

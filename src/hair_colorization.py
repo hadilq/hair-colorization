@@ -165,13 +165,18 @@ class HairColorization:
         self.model.compile(
             #optimizer=Adam(learning_rate=0.0001),
             optimizer=SGD(
-                learning_rate=10.0
+                learning_rate=100.0
             ),
             loss='mean_squared_error',
             metrics=['accuracy']
         )
 
     def predict(self, img, b_mask, gray_img, hue, output_dir):
+        """
+            Evaluate the mode to predict.
+            The 'img', and 'gray_img' must be in HSV space.
+            The outputs are also in HSV space.
+        """
         if img is None:
             log(3, "cannot make data!")
             return None
@@ -191,6 +196,9 @@ class HairColorization:
         )
 
     def postprocess_image(self, img, prediction, b_mask, window):
+        """
+            Postprocess image. The 'img' must be in HSV space. The outputs are also in HSV space.
+        """
         window_top_left_y, window_top_left_x,\
             window_bottom_right_y, window_bottom_right_x = window
         window_size = (
@@ -212,13 +220,14 @@ class HairColorization:
         return postprocess_image
 
     def preprocess_image(self, img, requested_hue, gray_img, b_mask, output_dir):
+        """
+            Preprocess image. The 'img' must be in HSV space. The outputs are also in HSV space.
+        """
         assert self.img_h / self.img_w == img.shape[0] / img.shape[1],\
             "the requested width/height ratio must be the same as ratio in the original image."
         assert self.img_h < img.shape[0],\
             "the requested width/height must be smaller than the original image."
-        requested_rgb_color = cv.cvtColor(
-            np.array([[[requested_hue, 255, 255]]], dtype = np.uint8), cv.COLOR_HSV2RGB
-        )[0][0]
+
         window_top_left_y, window_top_left_x = img.shape[0], img.shape[1]
         window_bottom_right_y, window_bottom_right_x = 0, 0
         ll = 1
@@ -285,9 +294,9 @@ class HairColorization:
                     processed_img[y - window_top_left_y][x - window_top_left_x] = gray_img[y][x]
                 else:
                     processed_img[y - window_top_left_y][x - window_top_left_x] =\
-                        requested_rgb_color
+                        [requested_hue, 255, 255]
                     expected_img[y - window_top_left_y][x - window_top_left_x] =\
-                        requested_rgb_color
+                        [requested_hue, 255, 255]
 
         processed_img = cv.resize(processed_img, (self.img_h, self.img_w), interpolation= cv.INTER_LINEAR)
         expected_img = cv.resize(expected_img, (self.img_h, self.img_w), interpolation= cv.INTER_LINEAR)
@@ -321,7 +330,7 @@ class HairColorizationPyDataset(PyDataset):
         **kwargs
     ):
         super().__init__(**kwargs)
-        self.sample_expansion_rate = 2 # it's defined by the number of data points.
+        self.sample_expansion_rate = 3 # it's defined by the number of data points.
         assert batch_size % self.sample_expansion_rate == 0,\
                 "batch_size({0}) must be divisible by {1}".format(batch_size, self.sample_expansion_rate)
         self.data_list = glob.glob(path.abspath(data_dir) + f'/*.json')
@@ -354,6 +363,7 @@ class HairColorizationPyDataset(PyDataset):
                     # hues.append(data['max_hue'])
                     hues.append(data['mean_hue'])
                     hues.append(data['median_hue'])
+                    hues.append(data['mode_hue'])
                 except json.JSONDecodeError as e:
                     raise "cannot parse: {0}, {1}".format(json_path, e)
             # This is how we define the self.sample_expansion_rate
@@ -364,8 +374,8 @@ class HairColorizationPyDataset(PyDataset):
             processed_img_path_list, true_img_path_list = list(), list()
             all_caches_exist = True
             for i in range(len(hues)):
-                processed_img_name = splitted_name[0] + '-processed-img-cache.' + str(i) + '.jpg'
-                true_img_name = splitted_name[0] + '-true-img-cache.' + str(i) + '.jpg'
+                processed_img_name = splitted_name[0] + '-processed-img-cache.1.' + str(i) + '.jpg'
+                true_img_name = splitted_name[0] + '-true-img-cache.1.' + str(i) + '.jpg'
                 processed_img_path = os.path.join(self.data_dir, processed_img_name)
                 true_img_path = os.path.join(self.data_dir, true_img_name)
                 processed_img_path_list.append(processed_img_path)
@@ -380,6 +390,8 @@ class HairColorizationPyDataset(PyDataset):
                     processed_img = cv.imread(processed_img_path)
                     true_img = cv.imread(true_img_path)
                     if processed_img is not None and true_img is not None:
+                        processed_img = cv.cvtColor(processed_img, cv.COLOR_BGR2HSV)
+                        true_img = cv.cvtColor(true_img, cv.COLOR_BGR2HSV)
                         hue_list.append(hues[i])
                         processed_img_list.append(processed_img)
                         true_img_list.append(true_img)
@@ -403,12 +415,13 @@ class HairColorizationPyDataset(PyDataset):
             img = cv.imread(image_path)
             if img is None:
                 raise "cannot parse: {0}".format(image_path)
-            img = cv.cvtColor(img, cv.COLOR_BGR2RGB)
+            img = cv.cvtColor(img, cv.COLOR_BGR2HSV)
 
             gray_img = cv.imread(gray_path)
             if gray_img is None:
                 log(3, )
                 raise "cannot parse gray image: {0}".format(gray_path)
+            gray_img = cv.cvtColor(gray_img, cv.COLOR_BGR2HSV)
 
             b_mask = cv.imread(b_mask_path)
             if b_mask is None:
@@ -425,8 +438,8 @@ class HairColorizationPyDataset(PyDataset):
                 true_img_path = true_img_path_list[i]
                 log(ll, "processed_img_path: {0}", processed_img_path)
                 log(ll, "true_img_path: {0}", true_img_path)
-                cv.imwrite(processed_img_path, processed_img)
-                cv.imwrite(true_img_path, true_img)
+                cv.imwrite(processed_img_path, cv.cvtColor(processed_img, cv.COLOR_HSV2BGR))
+                cv.imwrite(true_img_path,cv.cvtColor(true_img, cv.COLOR_HSV2BGR))
 
                 hue_list.append(hue)
                 processed_img_list.append(processed_img)
@@ -465,6 +478,8 @@ def predict(image_path, hue, hair_sgment_model_path, hair_colorization_model_pat
     segmentor.load_model(hair_sgment_model_path)
     img, b_mask, _ = segmentor.make_data(image_path)
     gray_img = segmentor.make_gray_hair(img, b_mask)
+    img = cv.cvtColor(img, cv.COLOR_RGB2HSV)
+    gray_img = cv.cvtColor(gray_img, cv.COLOR_GRAY2HSV)
     del segmentor
     # the trained model expects 240x240 image size
     colorizor = HairColorization(240, 240)
@@ -473,23 +488,35 @@ def predict(image_path, hue, hair_sgment_model_path, hair_colorization_model_pat
     del colorizor
 
     logImage(3, output_dir, img)
-    logImage(3, output_dir, result)
+    result = cv.cvtColor(result, cv.COLOR_HSV2BGR)
+    logImage(3, output_dir, result, img_space=LOG_BGR_IMAGE)
     return result
 
-def logImage(level, output_dir, img):
-     if level > 2:
-        from PIL import Image as Img
-        from IPython.display import display, Image
 
-        img_path = output_dir + f'/log_img.png'
-        Img.fromarray(img, 'RGB').save(img_path)
-        display(Image(filename=img_path, height=600))
+"""
+Image spaces used by logger.
+"""
+LOG_HSV_IMAGE = 0
+LOG_BGR_IMAGE = 1
+
+def logImage(level, output_dir, img, img_space=LOG_HSV_IMAGE):
+    """
+        Log image in Jupyter lab.
+    """
+    if level > 2:
+       from IPython.display import display, Image
+
+       img_path = output_dir + f'/.log_img.png'
+       if img_space == LOG_HSV_IMAGE:
+           img = cv.cvtColor(img, cv.COLOR_HSV2BGR)
+       cv.imwrite(img_path, img)
+       display(Image(filename=img_path, height=600))
 
 def log(level, s, *arg):
-     if level > 2:
-        if arg:
-            print(s.format(*arg))
-        else:
-            print(s)
+    if level > 2:
+       if arg:
+           print(s.format(*arg))
+       else:
+           print(s)
 
 
