@@ -202,13 +202,13 @@ pkgs.mkShell {
 
   inherit buildInputs venvDir;
 
-  propagatedBuildInputs = [
-    pkgs.stdenv.cc.cc.lib
-  ];
-
   LANG = "en_US.UTF-8";
 
   shellHook = ''
+    export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath [
+      pkgs.stdenv.cc.cc
+    ]}
+
     if [[ -d "${venvDir}" ]]; then
       echo "Skipping venv creation, '${venvDir}' already exists"
       source "${venvDir}/bin/activate"
