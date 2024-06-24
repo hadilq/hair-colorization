@@ -1,7 +1,10 @@
 import tensorflow as tf
 from keras.optimizers import Adam
 from keras.optimizers import SGD
+from keras.layers import BatchNormalization
+from keras.layers import Activation
 from keras.layers import Conv2D
+from keras.layers import Lambda
 from keras.layers import MaxPooling2D
 from keras.layers import UpSampling2D
 from keras.layers import Flatten
@@ -32,64 +35,185 @@ class HairColorization:
     def __init__(self, img_h, img_w):
         self.img_h, self.img_w = img_h, img_w
 
-    def define_model(self):
-        img_inputs = Input(shape=(self.img_h, self.img_w, 3,))
-        hue_inputs = Input(shape=(1,))
+    def define_model_step_1(self):
+        initializer = tf.keras.initializers.HeNormal()
 
         encoder_layers = [
-            Conv2D(64, (3,3), activation='relu', padding='same', strides=2),
-            Conv2D(128, (3,3), activation='relu', padding='same'),
-            Conv2D(128, (3,3), activation='relu', padding='same'),
-            Conv2D(128, (3,3), activation='relu', padding='same'),
-            Conv2D(128, (3,3), activation='relu', padding='same'),
-            Conv2D(128, (3,3), activation='relu', padding='same'),
-            Conv2D(128, (3,3), activation='relu', padding='same', strides=2),
-            Conv2D(256, (3,3), activation='relu', padding='same'),
-            Conv2D(256, (3,3), activation='relu', padding='same'),
-            Conv2D(256, (3,3), activation='relu', padding='same'),
-            Conv2D(256, (3,3), activation='relu', padding='same'),
-            Conv2D(256, (3,3), activation='relu', padding='same'),
-            Conv2D(256, (3,3), activation='relu', padding='same', strides=2),
-            Conv2D(512, (3,3), activation='relu', padding='same'),
-            Conv2D(512, (3,3), activation='relu', padding='same'),
-            Conv2D(512, (3,3), activation='relu', padding='same'),
-            Conv2D(512, (3,3), activation='relu', padding='same'),
-            Conv2D(512, (3,3), activation='relu', padding='same'),
-            Conv2D(512, (3,3), activation='relu', padding='same', strides=2),
-            Conv2D(256, (3,3), activation='relu', padding='same'),
-            Conv2D(256, (3,3), activation='relu', padding='same'),
-            Conv2D(256, (3,3), activation='relu', padding='same'),
-            Conv2D(256, (3,3), activation='relu', padding='same'),
-            Conv2D(256, (3,3), activation='relu', padding='same'),
+            Conv2D(
+                128, (3,3), activation='relu',
+                kernel_initializer=initializer, padding='same', strides=2,
+                name = 'step_1_en_conv2d_128'
+            ),
+            Conv2D(
+                256, (3,3), activation='relu',
+                kernel_initializer=initializer, padding='same', strides=2,
+                name = 'step_1_en_conv2d_256'
+            ),
+            BatchNormalization(axis=3, name = 'step_1_en_batch_normalization'),
+            Activation("softmax"),
         ]
 
         decoder_layers = [
-            Conv2D(256, (3,3), activation='relu', padding='same'),
-            Conv2D(256, (3,3), activation='relu', padding='same'),
-            Conv2D(256, (3,3), activation='relu', padding='same'),
-            Conv2D(256, (3,3), activation='relu', padding='same'),
-            Conv2D(256, (3,3), activation='relu', padding='same'),
+            Conv2D(
+                128, (3,3), activation='relu',
+                kernel_initializer=initializer, padding='same',
+                name = 'step_1_de_conv2d_128'
+            ),
             UpSampling2D((2, 2)),
-            Conv2D(128, (3,3), activation='relu', padding='same'),
-            Conv2D(128, (3,3), activation='relu', padding='same'),
-            Conv2D(128, (3,3), activation='relu', padding='same'),
-            Conv2D(128, (3,3), activation='relu', padding='same'),
-            Conv2D(128, (3,3), activation='relu', padding='same'),
+            Conv2D(
+                3, (3, 3), activation='relu',
+                kernel_initializer=initializer, padding='same',
+                name = 'step_1_de_conv2d_3'
+            ),
             UpSampling2D((2, 2)),
-            Conv2D(64, (3,3), activation='relu', padding='same'),
-            Conv2D(64, (3,3), activation='relu', padding='same'),
-            Conv2D(64, (3,3), activation='relu', padding='same'),
-            Conv2D(64, (3,3), activation='relu', padding='same'),
-            Conv2D(64, (3,3), activation='relu', padding='same'),
-            UpSampling2D((2, 2)),
-            Conv2D(32, (3,3), activation='relu', padding='same'),
-            Conv2D(32, (3,3), activation='relu', padding='same'),
-            Conv2D(32, (3,3), activation='relu', padding='same'),
-            Conv2D(32, (3,3), activation='relu', padding='same'),
-            Conv2D(16, (3,3), activation='relu', padding='same'),
-            Conv2D(3, (3, 3), activation='tanh', padding='same'),
-            UpSampling2D((2, 2)),
+            Activation("softmax"),
         ]
+
+        self.build_model(encoder_layers, decoder_layers)
+
+    def define_model_step_2_dry_run(self):
+        img_inputs = Input(shape=(self.img_h, self.img_w, 3,))
+        hue_inputs = Input(shape=(1,))
+
+        initializer = tf.keras.initializers.HeNormal()
+
+        encoder_layers = [
+            Conv2D(
+                128, (3,3), activation='relu',
+                kernel_initializer=initializer, padding='same',
+                name = 'step_2_en_conv2d_128'
+            ),
+            Conv2D(
+                128, (3,3), activation='relu',
+                kernel_initializer=initializer, padding='same', strides=2,
+                name = 'step_1_en_conv2d_128'
+            ),
+            Conv2D(
+                256, (3,3), activation='relu',
+                kernel_initializer=initializer, padding='same',
+                name = 'step_2_en_conv2d_256'
+            ),
+            Conv2D(
+                256, (3,3), activation='relu',
+                kernel_initializer=initializer, padding='same', strides=2,
+                name = 'step_1_en_conv2d_256'
+            ),
+            Conv2D(
+                512, (3,3), activation='relu',
+                kernel_initializer=initializer, padding='same', strides=2,
+                name = 'step_2_en_conv2d_512'
+            ),
+            BatchNormalization(axis=3, name = 'step_1_en_batch_normalization'),
+            Activation("softmax"),
+        ]
+
+        decoder_layers = [
+            Conv2D(
+                256, (3, 3), activation='relu',
+                kernel_initializer=initializer, padding='same',
+                name = 'step_2_de_conv2d_256'
+            ),
+            UpSampling2D((2, 2)),
+            Conv2D(
+                128, (3,3), activation='relu',
+                kernel_initializer=initializer, padding='same',
+                name = 'step_1_de_conv2d_128'
+            ),
+            UpSampling2D((2, 2)),
+            Conv2D(
+                3, (3, 3), activation='relu',
+                kernel_initializer=initializer, padding='same',
+                name = 'step_1_de_conv2d_3'
+            ),
+            UpSampling2D((2, 2)),
+            Activation("softmax"),
+        ]
+
+        self.build_model(img_inputs, hue_inputs, encoder_layers, decoder_layers)
+
+    def define_model_step_2(self):
+        """
+            To run this step, you need to already defined the model in the step one,
+            the modify it add more layers.
+        """
+        initializer = tf.keras.initializers.HeNormal()
+
+        layers = self.model.layers
+        encoder_layers_count = 18
+        encoder_layers = [l for l in layers[:encoder_layers_count] if l.weights]
+        decoder_layers = [l for l in layers[encoder_layers_count:] if l.weights]
+
+        log(3, "encoder_layers with weights: {0}", encoder_layers)
+        log(3, "decoder_layers with weights: {0}", decoder_layers)
+        
+        encoder_layers_insert_map = {
+            1: [
+                Conv2D(
+                    128, (3,3), activation='relu',
+                    kernel_initializer=initializer, padding='same',
+                    name = 'step_2_en_conv2d_128'
+                ),
+            ],
+            2: [
+                Conv2D(
+                    256, (3,3), activation='relu',
+                    kernel_initializer=initializer, padding='same',
+                    name = 'step_2_en_conv2d_256'
+                ),
+            ],
+            3: [ Activation("softmax") ],
+        }
+
+        decoder_layers_insert_map = {
+            0: [
+                Conv2D(
+                    256, (3, 3), activation='relu',
+                    kernel_initializer=initializer, padding='same',
+                    name = 'step_2_de_conv2d_256'
+                ),
+                UpSampling2D((2, 2)),
+                Lambda(
+                    lambda x: tf.pad(
+                        x,
+                        tf.constant([[0, 0], [0, 0], [0, 0], [0, 2]]),
+                        'CONSTANT',
+                    ),
+                    output_shape=(120, 120, 258),
+                ),
+            ],
+            2: [
+                UpSampling2D((2, 2)),
+                Activation("softmax"),
+            ],
+        }
+
+        step_2_encoder_layers = self.insert_layers(encoder_layers, encoder_layers_insert_map)
+        step_2_decoder_layers = self.insert_layers(decoder_layers, decoder_layers_insert_map)
+
+        log(3, "new_encoder_layers: {0}", step_2_encoder_layers)
+        log(3, "new_decoder_layers: {0}", step_2_decoder_layers)
+        self.build_model(step_2_encoder_layers, step_2_decoder_layers)
+
+    def insert_layers(self, old_layers, new_layers_insert_map):
+        count = 0
+        updated_layers = []
+        while count < len(old_layers):
+            if count in new_layers_insert_map:
+                updated_layers.extend(new_layers_insert_map[count])
+                del new_layers_insert_map[count]
+            else:
+                updated_layers.append(old_layers[count])
+                count += 1
+
+        rest_keys = sorted(new_layers_insert_map.keys())
+        for k in rest_keys:
+            updated_layers.extend(new_layers_insert_map[k])
+        return updated_layers
+
+
+    def build_model(self, encoder_layers, decoder_layers):
+        img_inputs = Input(shape=(self.img_h, self.img_w, 3,))
+        hue_inputs = Input(shape=(1,))
 
         encoder_output = img_inputs
         for layer in encoder_layers:
@@ -114,7 +238,20 @@ class HairColorization:
         self.model.summary()
 
         # Un-comment before commit!!
-        plot_model(self.model, to_file=dir_path + f'/autoencoder_colorization.png', show_shapes=True)
+        # plot_model(self.model, to_file=dir_path + f'/autoencoder_colorization.png', show_shapes=True)
+
+    def load_model_step_1(self, model_path=model_path):
+        self.define_model_step_1()
+        self.model.load_weights(model_path)
+
+    def load_model_step_2(self, model_path=model_path):
+        self.define_model_step_1()
+        self.define_model_step_2()
+        self.model.load_weights(model_path)
+
+    def load_model(self, model_path=model_path):
+        self.model = tf.keras.models.load_model(model_path, compile=False)
+        self.compile_model()
 
     def train(
             self, image_dir, output_dir, data_dir,
@@ -138,12 +275,12 @@ class HairColorization:
 
             self.fit_history = self.model.fit(dataset, epochs=10, verbose=2)
 
-            self.save_model(model_path, index)
+            self.save_model_weights(model_path, index)
             index += 1
 
             log(3, "history: {0}", self.fit_history.history)
-            max_accuracy = max(self.fit_history.history.get('accuracy'))
-            log(3, "accuracy: {0}", max_accuracy)
+            max_accuracy = max(self.fit_history.history.get('acc'))
+            log(3, "max accuracy: {0}", max_accuracy)
             if max_accuracy > 0.95:
                 break
 
@@ -156,19 +293,24 @@ class HairColorization:
         )
         self.model.save(indexed_model_path)
 
-    def load_model(self, model_path=model_path):
-        self.model = tf.keras.models.load_model(model_path, compile=False)
-        self.compile_model()
-    
+    def save_model_weights(self, model_path, index):
+        model_name = path.basename(model_path)
+        splitted_name = path.splitext(model_name)
+        indexed_model_path = os.path.join(
+            os.path.dirname(model_path),
+            splitted_name[0] + '.' + str(index) + '.weights.h5'
+        )
+        self.model.save_weights(indexed_model_path)
 
     def compile_model(self):
         self.model.compile(
-            #optimizer=Adam(learning_rate=0.0001),
-            optimizer=SGD(
-                learning_rate=100.0
-            ),
-            loss='mean_squared_error',
-            metrics=['accuracy']
+            optimizer=Adam(learning_rate=0.001),
+            #optimizer=SGD(
+            #    learning_rate=0.1
+            #),
+            #loss='mean_squared_error',
+            loss='categorical_crossentropy',
+            metrics=['acc']
         )
 
     def predict(self, img, b_mask, gray_img, hue, output_dir):
@@ -186,19 +328,20 @@ class HairColorization:
         logImage(3, output_dir, processed_img)
         logImage(3, output_dir, true_img)
         prediction = self.model.predict(
-            (( np.array([ processed_img ]),
-               np.array([ hue ])
-              )),
+            ( np.array([ processed_img ]), np.array([ hue ]) ),
             verbose = 2
         )
+        log(3, "predicted shape: {0}", prediction.shape)
         return self.postprocess_image(
-            img, (prediction[0]).astype(np.uint8), b_mask, window
+            img, (prediction[0]).astype(np.uint8), b_mask, window, output_dir
         )
 
-    def postprocess_image(self, img, prediction, b_mask, window):
+    def postprocess_image(self, img, prediction, b_mask, window, output_dir):
         """
             Postprocess image. The 'img' must be in HSV space. The outputs are also in HSV space.
         """
+        logImage(3, output_dir, prediction)
+        log(3, "predicted image: {0}", prediction)
         window_top_left_y, window_top_left_x,\
             window_bottom_right_y, window_bottom_right_x = window
         window_size = (
@@ -206,6 +349,7 @@ class HairColorization:
             window_bottom_right_x - window_top_left_x,
         )
         processed_img = cv.resize(prediction, window_size, interpolation= cv.INTER_LINEAR)
+        logImage(3, output_dir, processed_img)
 
         postprocess_image = img.copy()
         log(
@@ -282,21 +426,11 @@ class HairColorization:
         log(ll, "after window_bottom_right_x: {0}", window_bottom_right_x)
 
         expected_img = img[window_top_left_y:window_bottom_right_y + 1,window_top_left_x: window_bottom_right_x + 1][:]
+        processed_img = gray_img[window_top_left_y:window_bottom_right_y + 1,window_top_left_x: window_bottom_right_x + 1][:]
         expected_img = expected_img.copy()
-        processed_img = expected_img.copy()
-        mask_shape = (window_bottom_right_y - window_top_left_y + 1, window_bottom_right_x - window_top_left_x + 1, 1)
+        processed_img = processed_img.copy()
         log(ll, "expected_img shape: {0}", expected_img.shape)
         log(ll, "processed_img shape: {0}", processed_img.shape)
-
-        for y in range(window_top_left_y, window_bottom_right_y + 1):
-            for x in range(window_top_left_x, window_bottom_right_x + 1):
-                if b_mask[y][x].any():
-                    processed_img[y - window_top_left_y][x - window_top_left_x] = gray_img[y][x]
-                else:
-                    processed_img[y - window_top_left_y][x - window_top_left_x] =\
-                        [requested_hue, 255, 255]
-                    expected_img[y - window_top_left_y][x - window_top_left_x] =\
-                        [requested_hue, 255, 255]
 
         processed_img = cv.resize(processed_img, (self.img_h, self.img_w), interpolation= cv.INTER_LINEAR)
         expected_img = cv.resize(expected_img, (self.img_h, self.img_w), interpolation= cv.INTER_LINEAR)
@@ -374,7 +508,7 @@ class HairColorizationPyDataset(PyDataset):
             processed_img_path_list, true_img_path_list = list(), list()
             all_caches_exist = True
             for i in range(len(hues)):
-                processed_img_name = splitted_name[0] + '-processed-img-cache.1.' + str(i) + '.jpg'
+                processed_img_name = splitted_name[0] + '-processed-img-3-cache.' + str(i) + '.jpg'
                 true_img_name = splitted_name[0] + '-true-img-cache.1.' + str(i) + '.jpg'
                 processed_img_path = os.path.join(self.data_dir, processed_img_name)
                 true_img_path = os.path.join(self.data_dir, true_img_name)
@@ -472,6 +606,8 @@ def predict(image_path, hue, hair_sgment_model_path, hair_colorization_model_pat
     import gc
     import importlib
     import sys
+    import torch
+    torch.cuda.empty_cache()
     sys.path.append(dir_path)
     segment_mod = importlib.import_module('hair_segment')
     segmentor = segment_mod.HairSegment()
@@ -479,11 +615,11 @@ def predict(image_path, hue, hair_sgment_model_path, hair_colorization_model_pat
     img, b_mask, _ = segmentor.make_data(image_path)
     gray_img = segmentor.make_gray_hair(img, b_mask)
     img = cv.cvtColor(img, cv.COLOR_RGB2HSV)
-    gray_img = cv.cvtColor(gray_img, cv.COLOR_GRAY2HSV)
+    gray_img = cv.cvtColor(cv.cvtColor(gray_img, cv.COLOR_GRAY2BGR), cv.COLOR_RGB2HSV)
     del segmentor
     # the trained model expects 240x240 image size
     colorizor = HairColorization(240, 240)
-    colorizor.load_model(hair_colorization_model_path)
+    colorizor.load_model_step_2(hair_colorization_model_path)
     result = colorizor.predict(img, b_mask, gray_img, hue, output_dir)
     del colorizor
 
