@@ -66,23 +66,11 @@ class HairColorization:
             kernel_initializer=initializer,
         )(img_inputs)
         encoder_output = Conv2D(
-            128, (3,3), activation='relu', padding='same',
-            kernel_initializer=initializer,
-        )(encoder_output)
-        encoder_output = Conv2D(
             128, (3,3), activation='relu', padding='same', strides=2,
             kernel_initializer=initializer,
         )(encoder_output)
         encoder_output = Conv2D(
-            256, (3,3), activation='relu', padding='same',
-            kernel_initializer=initializer,
-        )(encoder_output)
-        encoder_output = Conv2D(
             256, (3,3), activation='relu', padding='same', strides=2,
-            kernel_initializer=initializer,
-        )(encoder_output)
-        encoder_output = Conv2D(
-            512, (3,3), activation='relu', padding='same',
             kernel_initializer=initializer,
         )(encoder_output)
         encoder_output = Conv2D(
