@@ -5,4 +5,5 @@ numpy==1.26.4
 tensorrt==10.0.1
 pydot==2.0.0
 ultralytics==8.2.29
+h5py==3.11.0
 

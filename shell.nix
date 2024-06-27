@@ -42,12 +42,12 @@ let
     inputsEnv = python3.withPackages (p: with p; [
       setuptools
       numpy
-       absl-py
-       rich
-       h5py
-       optree
-       ml-dtypes
-       namex
+      absl-py
+      rich
+      h5py
+      optree
+      ml-dtypes
+      namex
     ]);
 
     nativeBuildInputs = [
@@ -175,6 +175,7 @@ let
     gast
     opt-einsum
     flatbuffers
+    h5py
     (lib.hiPrio tensorboard)
     (lib.hiPrio tensorboard-plugin-profile)
     (lib.hiPrio protobuf)
