@@ -35,6 +35,114 @@ class HairColorization:
     def __init__(self, img_h, img_w):
         self.img_h, self.img_w = img_h, img_w
 
+    def define_model(self):
+        img_inputs = Input(shape=(self.img_h, self.img_w, 3,))
+        hue_inputs = Input(shape=(1,))
+        initializer = tf.keras.initializers.HeNormal()
+
+        vgg16_layers = tf.keras.applications.VGG16().layers
+        vgg16_layers.pop(0)
+        vgg16_layers.pop()
+        image_feature = img_inputs
+
+        for layer in vgg16_layers:
+            layer.trainable = False
+            image_feature = layer(image_feature)
+
+        #still underfitted so it's not needed
+        #image_feature = Dropout(0.5)(image_feature)
+        image_feature = Dense(
+            1023, activation='relu',
+            kernel_initializer=initializer,
+        )(image_feature)
+
+        image_feature = Concatenate(axis=1)([hue_inputs, image_feature])
+
+        log(3, "image_feature shape: {0}", image_feature.shape)
+
+        # encoder
+        encoder_output = Conv2D(
+            64, (3,3), activation='relu', padding='same', strides=2,
+            kernel_initializer=initializer,
+        )(img_inputs)
+        encoder_output = Conv2D(
+            128, (3,3), activation='relu', padding='same',
+            kernel_initializer=initializer,
+        )(encoder_output)
+        encoder_output = Conv2D(
+            128, (3,3), activation='relu', padding='same', strides=2,
+            kernel_initializer=initializer,
+        )(encoder_output)
+        encoder_output = Conv2D(
+            256, (3,3), activation='relu', padding='same',
+            kernel_initializer=initializer,
+        )(encoder_output)
+        encoder_output = Conv2D(
+            256, (3,3), activation='relu', padding='same', strides=2,
+            kernel_initializer=initializer,
+        )(encoder_output)
+        encoder_output = Conv2D(
+            512, (3,3), activation='relu', padding='same',
+            kernel_initializer=initializer,
+        )(encoder_output)
+        encoder_output = Conv2D(
+            512, (3,3), activation='relu', padding='same',
+            kernel_initializer=initializer,
+        )(encoder_output)
+        encoder_output = Conv2D(
+            256, (3,3), activation='relu', padding='same',
+            kernel_initializer=initializer,
+        )(encoder_output)
+
+        concat_shape = (
+            np.uint32(encoder_output.shape[1]),
+            np.uint32(encoder_output.shape[2]),
+            np.uint32(image_feature.shape[-1])
+        )
+
+        image_feature = RepeatVector((concat_shape[0] * concat_shape[1]).item())(image_feature)
+        image_feature = Reshape(concat_shape)(image_feature)
+
+        encoder_output = Concatenate(axis=3)([encoder_output, image_feature])
+
+        # decoder
+        decoder_output = Conv2D(
+            128, (3,3), activation='relu', padding='same',
+            kernel_initializer=initializer,
+        )(encoder_output)
+        decoder_output = UpSampling2D((2, 2))(decoder_output)
+        decoder_output = Conv2D(
+            64, (3,3), activation='relu', padding='same',
+            kernel_initializer=initializer,
+        )(decoder_output)
+        decoder_output = UpSampling2D((2, 2))(decoder_output)
+        decoder_output = Conv2D(
+            32, (3,3), activation='relu', padding='same',
+            kernel_initializer=initializer,
+        )(decoder_output)
+        decoder_output = Conv2D(
+            16, (3,3), activation='relu', padding='same',
+            kernel_initializer=initializer,
+        )(decoder_output)
+        decoder_output = Conv2D(
+            2, (3, 3), activation='tanh', padding='same',
+            kernel_initializer=initializer,
+        )(decoder_output)
+        decoder_output = UpSampling2D((2, 2))(decoder_output)
+
+        assert decoder_output.shape[0] == img_inputs.shape[0] and\
+                decoder_output.shape[1] == img_inputs.shape[1],\
+            "decoder_output shape is {0}, while inputs shape is {1}. They should be the same!"\
+            .format(decoder_output.shape, img_inputs.shape)
+
+        # tie it together
+        self.model = Model(inputs=[img_inputs, hue_inputs], outputs=decoder_output)
+        self.model.compile(loss='mean_squared_error', optimizer='adam', metrics=['acc'])
+        # summarize model
+        print(self.model.summary())
+        #plot_model(model, to_file='autoencoder_colorization_baseline.png', show_shapes=True)
+
+
     def define_model_step_1(self):
         initializer = tf.keras.initializers.HeNormal()
 
@@ -240,6 +348,10 @@ class HairColorization:
         # Un-comment before commit!!
         # plot_model(self.model, to_file=dir_path + f'/autoencoder_colorization.png', show_shapes=True)
 
+    def load_original_model(self, model_path=model_path):
+        self.define_original_model()
+        self.model.load_weights(model_path)
+
     def load_model_step_1(self, model_path=model_path):
         self.define_model_step_1()
         self.model.load_weights(model_path)
@@ -268,10 +380,13 @@ class HairColorization:
 
         index = init_index
         while True:
-            random_int = randint(1, 1000000)
-            tf.keras.utils.set_random_seed(random_int)
-            tf.config.experimental.enable_op_determinism()
-            log(3, "random seed: {0}", random_int)
+            # tensorflow 3.3.3 didn't implemnt XLA for MaxPooling2D(in the VGG16 model),
+            # don't turn the determism ON!
+            # GPU MaxPool gradient ops do not yet have a deterministic XLA implementation.
+            #random_int = randint(1, 1000000)
+            #tf.keras.utils.set_random_seed(random_int)
+            #tf.config.experimental.enable_op_determinism()
+            #log(3, "random seed: {0}", random_int)
 
             self.fit_history = self.model.fit(dataset, epochs=10, verbose=2)
 
@@ -526,6 +641,10 @@ class HairColorizationPyDataset(PyDataset):
                     if processed_img is not None and true_img is not None:
                         processed_img = cv.cvtColor(processed_img, cv.COLOR_BGR2HSV)
                         true_img = cv.cvtColor(true_img, cv.COLOR_BGR2HSV)
+
+                        # no need to predict Value in HSV, so remove it
+                        true_img = true_img[:,:,:2]
+
                         hue_list.append(hues[i])
                         processed_img_list.append(processed_img)
                         true_img_list.append(true_img)
@@ -574,6 +693,9 @@ class HairColorizationPyDataset(PyDataset):
                 log(ll, "true_img_path: {0}", true_img_path)
                 cv.imwrite(processed_img_path, cv.cvtColor(processed_img, cv.COLOR_HSV2BGR))
                 cv.imwrite(true_img_path,cv.cvtColor(true_img, cv.COLOR_HSV2BGR))
+
+                # no need to predict Value in HSV, so remove it
+                true_img = true_img[:,:,:2]
 
                 hue_list.append(hue)
                 processed_img_list.append(processed_img)
