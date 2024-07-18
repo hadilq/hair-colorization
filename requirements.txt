@@ -1,9 +1,7 @@
-keras==3.3.3
-tensorflow[and-cuda]==2.16.1
 tensorrt==10.0.1
 numpy==1.26.4
-tensorrt==10.0.1
 pydot==2.0.0
 ultralytics==8.2.29
 h5py==3.11.0
-
+torch==2.1.1+cu121
+torchvision==0.16.1+cu121

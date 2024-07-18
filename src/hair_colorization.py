@@ -1,498 +1,340 @@
-import tensorflow as tf
-from keras.optimizers import Adam
-from keras.optimizers import SGD
-from keras.layers import BatchNormalization
-from keras.layers import Activation
-from keras.layers import Conv2D
-from keras.layers import Lambda
-from keras.layers import MaxPooling2D
-from keras.layers import UpSampling2D
-from keras.layers import Flatten
-from keras.models import Model
-from keras.layers import Input
-from keras.layers import Dense
-from keras.layers import Dropout
-from keras.layers import RepeatVector
-from keras.layers import Reshape
-from keras.utils import plot_model
-from keras.utils import PyDataset
-from keras.layers import Concatenate
-from keras.applications.vgg16 import VGG16
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset
+from torch.utils.data import DataLoader
 import numpy as np
-import glob
+from torchvision import models
+import torchvision.transforms.functional as TF
 import os
-from os import path
+import glob
 import math
 import json
+from os import path
+import numpy as np
 import cv2 as cv
-from random import randint
+import importlib
+from importlib import reload
 
 dir_path = os.path.dirname(os.path.realpath(__file__))
-model_path = os.path.abspath(dir_path + '/../model/hair_colorization.keras')
+model_path = os.path.abspath(dir_path + '/../model/hair_colorization.pt')
+
+class MaskedLoss(nn.Module):
+    def __init__(self):
+        super(MaskedLoss, self).__init__()
+        self.mse_loss = nn.MSELoss(reduction='none')
+
+    def forward(self, pred, target, input_mask):
+        mse = F.mse_loss(pred, target, reduction='none')
+
+        # Apply the mask
+        masked_mse = mse * input_mask
+
+        # Calculate the mean loss over the masked elements
+        num_valid = input_mask.sum().clamp(min=1e-8)
+        loss = masked_mse.sum() / num_valid
+
+        return loss
+
+class MaskedLayer(nn.Module):
+    def __init__(self):
+        super(MaskedLayer, self).__init__()
+
+    def forward(self, x, img_inputs):
+        mask = img_inputs[:, 1:2, :, :]
+        mask = mask.repeat(1, 2, 1, 1)
+        true_255 = (mask == 255)
+        masked_output = torch.where(true_255, x, torch.tensor(0.0, device=x.device))
+        return masked_output
+
+class HairColorizationModel(nn.Module):
+    def __init__(self, img_h, img_w, processed_img_depth):
+        super(HairColorizationModel, self).__init__()
+        self.img_h, self.img_w = img_h, img_w
+        self.processed_img_depth = processed_img_depth
+
+        # Encoder
+        self.encoder = nn.Sequential(
+            nn.Conv2d(self.processed_img_depth, 64, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(256, 512, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(512, 256, kernel_size=3, padding=1),
+            nn.ReLU()
+        )
+
+        # Decoder
+        self.decoder = nn.Sequential(
+            nn.Conv2d(257, 128, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(128, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(64, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 16, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(16, 2, kernel_size=3, padding=1),
+            nn.Tanh(),
+            nn.Upsample(scale_factor=2)
+        )
+
+        self.masked_loss = MaskedLoss()
+
+    @torch.cuda.amp.autocast()
+    def forward(self, img_inputs, hue_inputs):
+        # Encoder
+        encoder_output = self.encoder(img_inputs)
+        log(1, "encoder_output shape: {0}", encoder_output.shape)
+
+        # Prepare hue input
+        batch_size, _, h, w = encoder_output.shape
+        hue_feature = hue_inputs.view(batch_size, 1, 1, 1).expand(-1, -1, h, w)
+
+        # Concatenate encoder output and hue feature
+        encoder_output = torch.cat([encoder_output, hue_feature], dim=1)
+
+        # Decoder
+        output = self.decoder(encoder_output)
+
+        return output
+
+    def compile(self, optimizer='adam'):
+        self.optimizer = optim.Adam(
+            self.parameters(), lr=0.000001
+        ) if optimizer == 'adam' else optim.SGD(
+            self.parameters(), lr=0.000001
+        )
+
+    def fit(self, dataloader, epochs=10, verbose=2):
+        self.train()
+        device = next(self.parameters()).device
+        scaler = torch.cuda.amp.GradScaler()
+        ll = 2
+
+        for epoch in range(epochs):
+            running_loss = 0.0
+            for batch_idx, ((processed_img, hue), true_img) in enumerate(dataloader):
+                processed_img = processed_img.to(device, non_blocking=True)\
+                    .permute(0, 3, 1, 2)\
+                    .to(torch.float16)
+                hue = hue.to(device, non_blocking=True)
+                true_img = true_img.to(device, non_blocking=True)\
+                    .permute(0, 3, 1, 2)\
+                    .to(torch.float16)
+                log(ll, "processed_img shape: {0}", processed_img.shape)
+                log(ll, "hue shape: {0}", hue.shape)
+                log(ll, "true_img shape: {0}", true_img.shape)
+
+                #self.optimizer.zero_grad(set_to_none=True)
+                outputs = self(processed_img, hue)
+                mask = processed_img[:, 1:2, :, :]
+                mask = (mask == 255).float()  # Convert to binary mask
+
+                # Calculate loss using the custom loss function
+                loss = self.masked_loss(outputs, true_img, mask)
+                loss.backward()
+                self.optimizer.step()
+                running_loss += loss.item()
+                if verbose == 2 and batch_idx % 10 == 9:
+                    log(3, f'[{epoch + 1}, {batch_idx + 1:5d}] loss: {running_loss / 10:.3f}')
+                    running_loss = 0.0
+
+        torch.cuda.synchronize()
+
+    def predict(self, processed_img, requested_hue):
+        self.eval()
+        device = next(self.parameters()).device
+        scaler = torch.cuda.amp.GradScaler()
+        with torch.no_grad():
+            processed_img = torch.from_numpy(processed_img).unsqueeze(0)\
+                    .to(device, non_blocking=True)\
+                    .permute(0, 3, 1, 2)\
+                    .to(torch.float16)
+
+            requested_hue = torch.tensor([requested_hue])\
+                    .to(device, non_blocking=True)\
+                    .to(torch.float16)
+            prediction = self(processed_img, requested_hue)
+        return prediction.permute(0, 2, 3, 1).squeeze(0).cpu().numpy().astype(np.uint8)
+
+    def load_model(self, model_path=model_path):
+        self.load_state_dict(torch.load(model_path))
+
+    def save_model(self, model_path=model_path, index=None):
+        if index is None:
+            indexed_model_path = model_path
+        else:
+            model_name = path.basename(model_path)
+            splitted_name = path.splitext(model_name)
+            indexed_model_path = os.path.join(
+                os.path.dirname(model_path),
+                splitted_name[0] + '.' + str(index) + splitted_name[1]
+            )
+        torch.save(self.state_dict(), indexed_model_path)
+
+class HairColorizationDataset(Dataset):
+
+    def __init__(
+        self,
+        image_dir,
+        output_dir,
+        data_dir,
+        num_train_samples,
+        img_h, img_w,
+        preprocess_image_fn,
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+        self.sample_expansion_rate = 3 # it's defined by the number of data points.
+        self.data_list = glob.glob(path.abspath(data_dir) + f'/*.json')
+        assert len(self.data_list) >= num_train_samples,\
+                "length of data_list: {0}, num_train_samples: {1}".format(
+            len(self.data_list), num_train_samples
+        )
+        self.output_dir = path.abspath(output_dir)
+        self.image_dir, self.data_dir = path.abspath(image_dir), path.abspath(data_dir)
+        self.num_train_samples = num_train_samples
+        self.img_h, self.img_w = img_h, img_w
+        self.preprocess_image = preprocess_image_fn
+
+
+    def __len__(self):
+        return self.num_train_samples * self.sample_expansion_rate
+
+    def __getitem__(self, idx):
+        data_idx = idx // self.sample_expansion_rate
+        hue_idx = idx % self.sample_expansion_rate
+        ll = 2
+
+        json_path = self.data_list[data_idx]
+        processed_img, true_img, data = self.preprocess_image(json_path)
+
+        hues = []
+        hues.append(data['mean_hue'])
+        hues.append(data['median_hue'])
+        hues.append(data['mode_hue'])
+        # This is how we define the self.sample_expansion_rate
+        assert(len(hues) == self.sample_expansion_rate)
+
+        hue = hues[hue_idx]
+        return (
+            (processed_img, hue),
+            true_img,
+        )
 
 class HairColorization:
 
-    def __init__(self, img_h, img_w):
-        self.img_h, self.img_w = img_h, img_w
+    def __init__(self, model_path=model_path):
+        self. model_path = model_path
+        self.img_h, self.img_w = 240, 240
+        self.processed_img_cache_suffix = '-processed-img-cache-1.npy'
+        self.true_img_cache_suffix = '-true-img-cache-0.jpg'
+        self.processed_img_depth = 9
 
-        vgg16_layers = tf.keras.applications.VGG16().layers
-        vgg16_layers.pop(0)
-        vgg16_layers.pop()
-        vgg16_layers.pop()
-        img_inputs = Input(shape=(self.img_h, self.img_w, 3,))
-        image_feature = img_inputs
-        for layer in vgg16_layers:
-            layer.trainable = False
-            image_feature = layer(image_feature)
-
-        self.vgg16_feature_size = 4096
-        assert self.vgg16_feature_size == image_feature.shape[1], \
-                "The output must be the same size of {0}, actual size: {1}"\
-                .format(
-                    self.vgg16_feature_size,
-                    image_feature
-                )
-        self.vgg16_model = Model(inputs=[img_inputs], outputs=image_feature)
-        self.vgg16_model.compile(loss='mean_squared_error', optimizer='adam', metrics=['acc'])
-
-
-    def define_model(self):
-        img_inputs = Input(shape=(self.img_h, self.img_w, 3,))
-        feature_inputs = Input(shape=(self.vgg16_feature_size,))
-        hue_inputs = Input(shape=(1,))
-        initializer = tf.keras.initializers.HeNormal()
-
-        #still underfitted so it's not needed
-        #image_feature = Dropout(0.5)(image_feature)
-        image_feature = feature_inputs
-        image_feature = Dense(
-            1023, activation='relu',
-            kernel_initializer=initializer,
-        )(image_feature)
-
-        image_feature = Concatenate(axis=1)([hue_inputs, image_feature])
-
-        log(3, "image_feature shape: {0}", image_feature.shape)
-
-        # encoder
-        encoder_output = Conv2D(
-            64, (3,3), activation='relu', padding='same', strides=2,
-            kernel_initializer=initializer,
-        )(img_inputs)
-        encoder_output = Conv2D(
-            128, (3,3), activation='relu', padding='same', strides=2,
-            kernel_initializer=initializer,
-        )(encoder_output)
-        encoder_output = Conv2D(
-            256, (3,3), activation='relu', padding='same', strides=2,
-            kernel_initializer=initializer,
-        )(encoder_output)
-        encoder_output = Conv2D(
-            512, (3,3), activation='relu', padding='same',
-            kernel_initializer=initializer,
-        )(encoder_output)
-        encoder_output = Conv2D(
-            256, (3,3), activation='relu', padding='same',
-            kernel_initializer=initializer,
-        )(encoder_output)
-
-        concat_shape = (
-            np.uint32(encoder_output.shape[1]),
-            np.uint32(encoder_output.shape[2]),
-            np.uint32(image_feature.shape[-1])
-        )
-
-        image_feature = RepeatVector((concat_shape[0] * concat_shape[1]).item())(image_feature)
-        image_feature = Reshape(concat_shape)(image_feature)
-
-        encoder_output = Concatenate(axis=3)([encoder_output, image_feature])
-
-        # decoder
-        decoder_output = Conv2D(
-            128, (3,3), activation='relu', padding='same',
-            kernel_initializer=initializer,
-        )(encoder_output)
-        decoder_output = UpSampling2D((2, 2))(decoder_output)
-        decoder_output = Conv2D(
-            64, (3,3), activation='relu', padding='same',
-            kernel_initializer=initializer,
-        )(decoder_output)
-        decoder_output = UpSampling2D((2, 2))(decoder_output)
-        decoder_output = Conv2D(
-            32, (3,3), activation='relu', padding='same',
-            kernel_initializer=initializer,
-        )(decoder_output)
-        decoder_output = Conv2D(
-            16, (3,3), activation='relu', padding='same',
-            kernel_initializer=initializer,
-        )(decoder_output)
-        decoder_output = Conv2D(
-            2, (3, 3), activation='tanh', padding='same',
-            kernel_initializer=initializer,
-        )(decoder_output)
-        decoder_output = UpSampling2D((2, 2))(decoder_output)
-
-        assert decoder_output.shape[0] == img_inputs.shape[0] and\
-                decoder_output.shape[1] == img_inputs.shape[1],\
-            "decoder_output shape is {0}, while inputs shape is {1}. They should be the same!"\
-            .format(decoder_output.shape, img_inputs.shape)
-
-        # tie it together
-        self.model = Model(inputs=[img_inputs, feature_inputs, hue_inputs], outputs=decoder_output)
-        self.model.compile(loss='mean_squared_error', optimizer='adam', metrics=['acc'])
-        # summarize model
-        print(self.model.summary())
-        #plot_model(model, to_file='autoencoder_colorization_baseline.png', show_shapes=True)
-
-
-    def define_model_step_1(self):
-        initializer = tf.keras.initializers.HeNormal()
-
-        encoder_layers = [
-            Conv2D(
-                128, (3,3), activation='relu',
-                kernel_initializer=initializer, padding='same', strides=2,
-                name = 'step_1_en_conv2d_128'
-            ),
-            Conv2D(
-                256, (3,3), activation='relu',
-                kernel_initializer=initializer, padding='same', strides=2,
-                name = 'step_1_en_conv2d_256'
-            ),
-            BatchNormalization(axis=3, name = 'step_1_en_batch_normalization'),
-            Activation("softmax"),
-        ]
-
-        decoder_layers = [
-            Conv2D(
-                128, (3,3), activation='relu',
-                kernel_initializer=initializer, padding='same',
-                name = 'step_1_de_conv2d_128'
-            ),
-            UpSampling2D((2, 2)),
-            Conv2D(
-                3, (3, 3), activation='relu',
-                kernel_initializer=initializer, padding='same',
-                name = 'step_1_de_conv2d_3'
-            ),
-            UpSampling2D((2, 2)),
-            Activation("softmax"),
-        ]
-
-        self.build_model(encoder_layers, decoder_layers)
-
-    def define_model_step_2_dry_run(self):
-        img_inputs = Input(shape=(self.img_h, self.img_w, 3,))
-        hue_inputs = Input(shape=(1,))
-
-        initializer = tf.keras.initializers.HeNormal()
-
-        encoder_layers = [
-            Conv2D(
-                128, (3,3), activation='relu',
-                kernel_initializer=initializer, padding='same',
-                name = 'step_2_en_conv2d_128'
-            ),
-            Conv2D(
-                128, (3,3), activation='relu',
-                kernel_initializer=initializer, padding='same', strides=2,
-                name = 'step_1_en_conv2d_128'
-            ),
-            Conv2D(
-                256, (3,3), activation='relu',
-                kernel_initializer=initializer, padding='same',
-                name = 'step_2_en_conv2d_256'
-            ),
-            Conv2D(
-                256, (3,3), activation='relu',
-                kernel_initializer=initializer, padding='same', strides=2,
-                name = 'step_1_en_conv2d_256'
-            ),
-            Conv2D(
-                512, (3,3), activation='relu',
-                kernel_initializer=initializer, padding='same', strides=2,
-                name = 'step_2_en_conv2d_512'
-            ),
-            BatchNormalization(axis=3, name = 'step_1_en_batch_normalization'),
-            Activation("softmax"),
-        ]
-
-        decoder_layers = [
-            Conv2D(
-                256, (3, 3), activation='relu',
-                kernel_initializer=initializer, padding='same',
-                name = 'step_2_de_conv2d_256'
-            ),
-            UpSampling2D((2, 2)),
-            Conv2D(
-                128, (3,3), activation='relu',
-                kernel_initializer=initializer, padding='same',
-                name = 'step_1_de_conv2d_128'
-            ),
-            UpSampling2D((2, 2)),
-            Conv2D(
-                3, (3, 3), activation='relu',
-                kernel_initializer=initializer, padding='same',
-                name = 'step_1_de_conv2d_3'
-            ),
-            UpSampling2D((2, 2)),
-            Activation("softmax"),
-        ]
-
-        self.build_model(img_inputs, hue_inputs, encoder_layers, decoder_layers)
-
-    def define_model_step_2(self):
-        """
-            To run this step, you need to already defined the model in the step one,
-            the modify it add more layers.
-        """
-        initializer = tf.keras.initializers.HeNormal()
-
-        layers = self.model.layers
-        encoder_layers_count = 18
-        encoder_layers = [l for l in layers[:encoder_layers_count] if l.weights]
-        decoder_layers = [l for l in layers[encoder_layers_count:] if l.weights]
-
-        log(3, "encoder_layers with weights: {0}", encoder_layers)
-        log(3, "decoder_layers with weights: {0}", decoder_layers)
-        
-        encoder_layers_insert_map = {
-            1: [
-                Conv2D(
-                    128, (3,3), activation='relu',
-                    kernel_initializer=initializer, padding='same',
-                    name = 'step_2_en_conv2d_128'
-                ),
-            ],
-            2: [
-                Conv2D(
-                    256, (3,3), activation='relu',
-                    kernel_initializer=initializer, padding='same',
-                    name = 'step_2_en_conv2d_256'
-                ),
-            ],
-            3: [ Activation("softmax") ],
-        }
-
-        decoder_layers_insert_map = {
-            0: [
-                Conv2D(
-                    256, (3, 3), activation='relu',
-                    kernel_initializer=initializer, padding='same',
-                    name = 'step_2_de_conv2d_256'
-                ),
-                UpSampling2D((2, 2)),
-                Lambda(
-                    lambda x: tf.pad(
-                        x,
-                        tf.constant([[0, 0], [0, 0], [0, 0], [0, 2]]),
-                        'CONSTANT',
-                    ),
-                    output_shape=(120, 120, 258),
-                ),
-            ],
-            2: [
-                UpSampling2D((2, 2)),
-                Activation("softmax"),
-            ],
-        }
-
-        step_2_encoder_layers = self.insert_layers(encoder_layers, encoder_layers_insert_map)
-        step_2_decoder_layers = self.insert_layers(decoder_layers, decoder_layers_insert_map)
-
-        log(3, "new_encoder_layers: {0}", step_2_encoder_layers)
-        log(3, "new_decoder_layers: {0}", step_2_decoder_layers)
-        self.build_model(step_2_encoder_layers, step_2_decoder_layers)
-
-    def insert_layers(self, old_layers, new_layers_insert_map):
-        count = 0
-        updated_layers = []
-        while count < len(old_layers):
-            if count in new_layers_insert_map:
-                updated_layers.extend(new_layers_insert_map[count])
-                del new_layers_insert_map[count]
-            else:
-                updated_layers.append(old_layers[count])
-                count += 1
-
-        rest_keys = sorted(new_layers_insert_map.keys())
-        for k in rest_keys:
-            updated_layers.extend(new_layers_insert_map[k])
-        return updated_layers
-
-
-    def build_model(self, encoder_layers, decoder_layers):
-        img_inputs = Input(shape=(self.img_h, self.img_w, 3,))
-        hue_inputs = Input(shape=(1,))
-
-        encoder_output = img_inputs
-        for layer in encoder_layers:
-            concat_shape = (np.uint32(encoder_output.shape[1]), np.uint32(encoder_output.shape[2]), np.uint32(hue_inputs.shape[-1]))
-
-            image_feature = RepeatVector((concat_shape[0] * concat_shape[1]).item())(hue_inputs)
-            image_feature = Reshape(concat_shape)(image_feature)
-            fusion_output = Concatenate(axis = 3)([encoder_output, image_feature])
-            encoder_output = layer(fusion_output)
-
-        decoder_output = encoder_output
-        for layer in decoder_layers:
-            decoder_output = layer(decoder_output)
-
-        assert decoder_output.shape == img_inputs.shape,\
-            "decoder_output shape is {0}, while inputs shape is {1}. They should be the same!"\
-            .format(decoder_output.shape, img_inputs.shape)
-
-        self.model = Model(inputs=[img_inputs, hue_inputs], outputs=decoder_output)
-        self.compile_model()
-        # summarize model
-        self.model.summary()
-
-        # Un-comment before commit!!
-        # plot_model(self.model, to_file=dir_path + f'/autoencoder_colorization.png', show_shapes=True)
-
-    def load_model(self, model_path=model_path):
-        self.define_model()
-        self.model.load_weights(model_path)
-        self.compile_model()
-
-    def load_model_step_1(self, model_path=model_path):
-        self.define_model_step_1()
-        self.model.load_weights(model_path)
-
-    def load_model_step_2(self, model_path=model_path):
-        self.define_model_step_1()
-        self.define_model_step_2()
-        self.model.load_weights(model_path)
-
-    def train(
+    def train_loop(
             self, image_dir, output_dir, data_dir,
             num_train_samples, batch_size, model_path=model_path,
-            init_index=3,
+            init_index=1,
             **kwargs
         ):
-        dataset = HairColorizationPyDataset(
-            image_dir, output_dir, data_dir, num_train_samples, batch_size,
+
+        def preprocess_image(json_path):
+            return self.preprocess_image_load_cache(
+                json_path, data_dir, withCache=True,
+            )
+
+        dataset = HairColorizationDataset(
+            image_dir, output_dir, data_dir, num_train_samples,
             self.img_h, self.img_w,
-            self.preprocess_image,
+            preprocess_image,
             **kwargs
         )
-
-        index = init_index
-        while True:
-            # tensorflow 3.3.3 didn't implemnt XLA for MaxPooling2D(in the VGG16 model),
-            # don't turn the determism ON!
-            # GPU MaxPool gradient ops do not yet have a deterministic XLA implementation.
-            #random_int = randint(1, 1000000)
-            #tf.keras.utils.set_random_seed(random_int)
-            #tf.config.experimental.enable_op_determinism()
-            #log(3, "random seed: {0}", random_int)
-
-            self.fit_history = self.model.fit(dataset, epochs=10, verbose=2)
-
-            if index % 10 == 0:
-                self.save_model_weights(model_path, index)
-            index += 1
-
-            log(3, "history: {0}", self.fit_history.history)
-            max_accuracy = max(self.fit_history.history.get('acc'))
-            log(3, "max accuracy: {0}", max_accuracy)
-            if max_accuracy > 0.95:
-                break
-
-    def save_model(self, model_path, index):
-        model_name = path.basename(model_path)
-        splitted_name = path.splitext(model_name)
-        indexed_model_path = os.path.join(
-            os.path.dirname(model_path),
-            splitted_name[0] + '.' + str(index) + splitted_name[1]
+        model = HairColorizationModel(self.img_h, self.img_w, self.processed_img_depth)
+        model.to('cuda')
+        model.compile()
+        if path.exists(model_path):
+            model.load_model(model_path)
+        dataloader = DataLoader(
+            dataset, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=4
         )
-        self.model.save(indexed_model_path)
+        model.fit(dataloader)
+        model.save_model(model_path)
 
-    def save_model_weights(self, model_path, index):
-        model_name = path.basename(model_path)
-        splitted_name = path.splitext(model_name)
-        indexed_model_path = os.path.join(
-            os.path.dirname(model_path),
-            splitted_name[0] + '.' + str(index) + '.weights.h5'
-        )
-        self.model.save_weights(indexed_model_path)
-
-    def compile_model(self):
-        self.model.compile(
-            optimizer=Adam(learning_rate=0.001),
-            #optimizer=SGD(
-            #    learning_rate=0.1
-            #),
-            #loss='mean_squared_error',
-            loss='categorical_crossentropy',
-            metrics=['acc']
-        )
-
-    def predict(self, img, b_mask, gray_img, hue, output_dir):
+    def predict(self, image_path, requested_hue, segmentor, hair_sgment_model_path, output_dir):
         """
             Evaluate the mode to predict.
-            The 'img', and 'gray_img' must be in HSV space.
-            The outputs are also in HSV space.
         """
-        if img is None:
-            log(3, "cannot make data!")
-            return None
-        processed_img, true_img, feature_data, window = self.preprocess_image(
-                img, hue, gray_img, b_mask, output_dir
+        ll = 3
+        segmentor.load_model(hair_sgment_model_path)
+        processed_img, true_img_hsv, img_rgb, b_mask, window = self.preprocess_image_with_cache(
+                image_path, output_dir, segmentor, withCache=False
         )
-        logImage(3, output_dir, processed_img)
-        logImage(3, output_dir, true_img)
-        prediction = self.model.predict(
-            ( np.array([ processed_img ]), np.array([ feature_data ]), np.array([ hue ])),
-            verbose = 2
-        )
-        log(3, "predicted shape: {0}", prediction.shape)
+        del segmentor.model
+        if window is None:
+            raise "withCache is False so window should not be None!"
+
+        model = HairColorizationModel(self.img_h, self.img_w, self.processed_img_depth)
+        model.to('cuda')
+        if path.exists(model_path):
+            model.load_model(model_path)
+        prediction = model.predict(processed_img, requested_hue)
+        log(ll, "predicted shape: {0}", prediction.shape)
         prediction = prediction[0]
         postprediction = np.zeros((self.img_h, self.img_w, 3))
-        postprediction[:,:,:-1] = prediction
-        postprediction[:,:,-2:] = true_img[:,:,-2:]
-        log(3, "postprediction shape: {0}", postprediction.shape)
+        postprediction[:,:,:2] = prediction
+        postprediction[:,:,2] = true_img_hsv[:,:,2:]
+        postprediction_hsv = postprediction.astype(np.uint8)
+        log(ll, "postprediction shape: {0}", postprediction_hsv.shape)
+        logImage(ll, output_dir, postprediction_hsv)
         return self.postprocess_image(
-            img, postprediction.astype(np.uint8), b_mask, window, output_dir
+            img_rgb, postprediction_hsv, b_mask, window, output_dir
         )
 
-    def postprocess_image(self, img, prediction, b_mask, window, output_dir):
+    def postprocess_image(self, img_rgb, prediction_hsv, b_mask, window, output_dir):
         """
-            Postprocess image. The 'img' must be in HSV space. The outputs are also in HSV space.
+            Postprocess image.
         """
-        log(3, "predicted image: {0}", prediction)
-        logImage(3, output_dir, prediction)
+        log(3, "predicted image: {0}", prediction_hsv)
+        logImage(3, output_dir, prediction_hsv)
         window_top_left_y, window_top_left_x,\
             window_bottom_right_y, window_bottom_right_x = window
         window_size = (
             window_bottom_right_y - window_top_left_y,
             window_bottom_right_x - window_top_left_x,
         )
-        processed_img = cv.resize(prediction, window_size, interpolation= cv.INTER_LINEAR)
-        logImage(3, output_dir, processed_img)
+        processed_img_hsv = cv.resize(prediction_hsv, window_size, interpolation= cv.INTER_LINEAR)
+        processed_img_rgb = cv.cvtColor(processed_img_hsv, cv.COLOR_HSV2RGB)
+        logImage(3, output_dir, processed_img_rgb, img_space=LOG_RGB_IMAGE)
 
-        postprocess_image = img.copy()
+        postprocess_img_rgb = img_rgb.copy()
         log(
             3, "shape of processed_img: {0}, postprocess_image: {1}, window: {2}",
-            processed_img.shape, postprocess_image.shape, window
+            processed_img_rgb.shape, postprocess_img_rgb.shape, window
         )
         for y in range(window_top_left_y, window_bottom_right_y):
             for x in range(window_top_left_x, window_bottom_right_x):
                 if b_mask[y][x].any():
-                    postprocess_image[y][x] = processed_img[y - window_top_left_y][x - window_top_left_x]
+                    postprocess_img_rgb[y][x] = processed_img_rgb[y - window_top_left_y][x - window_top_left_x]
 
-        return postprocess_image
+        return img_rgb, postprocess_img_rgb
 
-    def preprocess_image(self, img, requested_hue, gray_img, b_mask, output_dir):
+    def preprocess_image(self, img_rgb, gray_img, b_mask, label_img, output_dir):
         """
-            Preprocess image. The 'img' must be in HSV space. The outputs are also in HSV space.
+            Preprocess image.
         """
-        assert self.img_h / self.img_w == img.shape[0] / img.shape[1],\
+        assert self.img_h / self.img_w == img_rgb.shape[0] / img_rgb.shape[1],\
             "the requested width/height ratio must be the same as ratio in the original image."
-        assert self.img_h < img.shape[0],\
+        assert self.img_h < img_rgb.shape[0],\
             "the requested width/height must be smaller than the original image."
 
-        window_top_left_y, window_top_left_x = img.shape[0], img.shape[1]
+        window_top_left_y, window_top_left_x = img_rgb.shape[0], img_rgb.shape[1]
         window_bottom_right_y, window_bottom_right_x = 0, 0
         ll = 1
         for y, mask_y in enumerate(b_mask):
@@ -512,22 +354,22 @@ class HairColorization:
         window_size = [window_bottom_right_y - window_top_left_y, window_bottom_right_x - window_top_left_x]
         window_center = [window_top_left_y + window_size[0] / 2, window_top_left_x + window_size[1] / 2]
         expected_image_size_ratio = self.img_h / self.img_w
-        log(ll, "img shape: {0}", img.shape)
+        log(ll, "img shape: {0}", img_rgb.shape)
         log(ll, "expected_image_size_ratio: {0}", expected_image_size_ratio)
         log(ll, "before window_size: {0}", window_size)
         log(ll, "before window_center: {0}", window_center)
         if window_size[0] > window_size[1]:
             new_half_size_1 = (window_size[0] / expected_image_size_ratio) / 2
             window_size[1] = window_size[0] / expected_image_size_ratio
-            if window_center[1] + new_half_size_1 >= img.shape[1]:
-                window_center[1] = img.shape[1] - new_half_size_1 - 1
+            if window_center[1] + new_half_size_1 >= img_rgb.shape[1]:
+                window_center[1] = img_rgb.shape[1] - new_half_size_1 - 1
             elif window_center[1] - new_half_size_1 < 0:
                 window_center[1] = new_half_size_1
         else:
             new_half_size_0 = (window_size[1] * expected_image_size_ratio) / 2
             window_size[0] = window_size[1] * expected_image_size_ratio
-            if window_center[0] + new_half_size_0 >= img.shape[0]:
-                window_center[0] = img.shape[0] - new_half_size_0 - 1
+            if window_center[0] + new_half_size_0 >= img_rgb.shape[0]:
+                window_center[0] = img_rgb.shape[0] - new_half_size_0 - 1
             elif window_center[0] - new_half_size_0 < 0:
                 window_center[0] = new_half_size_0
 
@@ -545,23 +387,48 @@ class HairColorization:
         log(ll, "after window_bottom_right_y: {0}", window_bottom_right_y)
         log(ll, "after window_bottom_right_x: {0}", window_bottom_right_x)
 
-        expected_img = img[window_top_left_y:window_bottom_right_y + 1,window_top_left_x: window_bottom_right_x + 1][:]
-        processed_img = gray_img[window_top_left_y:window_bottom_right_y + 1,window_top_left_x: window_bottom_right_x + 1][:]
-        expected_img = expected_img.copy()
-        processed_img = processed_img.copy()
-        log(ll, "expected_img shape: {0}", expected_img.shape)
+
+        b_mask = b_mask[window_top_left_y:window_bottom_right_y + 1,window_top_left_x: window_bottom_right_x + 1]
+        b_mask = b_mask.reshape((b_mask.shape[0], b_mask.shape[1], 1))
+        area = 0
+        for y, m_y in enumerate(b_mask):
+            for x, m in enumerate(m_y):
+                if m:
+                    area += 1
+
+        masked_area = np.full(
+            (b_mask.shape[0], b_mask.shape[1], 1),
+            area, dtype=np.uint8
+        )
+
+        expected_img_rgb = img_rgb[window_top_left_y:window_bottom_right_y + 1,window_top_left_x: window_bottom_right_x + 1][:]
+        gray_img = gray_img[window_top_left_y:window_bottom_right_y + 1,window_top_left_x: window_bottom_right_x + 1]
+        gray_img = gray_img.reshape((gray_img.shape[0], gray_img.shape[1], 1))
+        label_img = label_img[window_top_left_y:window_bottom_right_y + 1,window_top_left_x: window_bottom_right_x + 1][:]
+        assert gray_img.shape[-1] + b_mask.shape[-1] + masked_area.shape[-1] + label_img.shape[-1] == self.processed_img_depth,\
+            "depth of processed_img({0}) is not what expected, {1}!".format(
+                gray_img.shape[-1]+ b_mask.shape[-1] + masked_area.shape[-1] + label_img.shape[-1],
+                self.processed_img_depth
+            )
+        processed_img = np.full(
+            (gray_img.shape[0], gray_img.shape[1], self.processed_img_depth),
+            -1, dtype=np.uint8
+        )
+        processed_img[:,:,:1] = gray_img
+        processed_img[:,:,1:2] = b_mask
+        processed_img[:,:,2:3] = masked_area
+        processed_img[:,:,3:] = label_img
+        log(ll, "expected_img shape: {0}", expected_img_rgb.shape)
         log(ll, "processed_img shape: {0}", processed_img.shape)
 
         processed_img = cv.resize(processed_img, (self.img_h, self.img_w), interpolation= cv.INTER_LINEAR)
-        expected_img = cv.resize(expected_img, (self.img_h, self.img_w), interpolation= cv.INTER_LINEAR)
+        expected_img_rgb = cv.resize(expected_img_rgb, (self.img_h, self.img_w), interpolation= cv.INTER_LINEAR)
 
-
-        logImage(ll, output_dir, img)
-        logImage(ll, output_dir, expected_img)
-        logImage(ll, output_dir, processed_img)
+        logImage(ll, output_dir, img_rgb, img_space=LOG_RGB_IMAGE)
+        logImage(ll, output_dir, expected_img_rgb, img_space=LOG_RGB_IMAGE)
 
         log(ll, "processed_img shape: {0}", processed_img.shape)
-        log(ll, "expected_img shape: {0}", expected_img.shape)
+        log(ll, "expected_img shape: {0}", expected_img_rgb.shape)
         window = (
             window_top_left_y,
             window_top_left_x,
@@ -569,183 +436,113 @@ class HairColorization:
             window_bottom_right_x,
         )
 
-        feature_data = self.vgg16_model.predict(
-            np.array([expected_img]),
-            verbose = 2
-        )
-        if feature_data is None:
-            raise "cannot compute feature data for this image: {0}".format(image_path)
-        log(ll, "feature_data shape {0}", feature_data.shape)
+        return processed_img, expected_img_rgb, window
 
-        return processed_img, expected_img, (feature_data[0]).astype(np.uint8), window
+    def preprocess_dataset(self, input_dir, output_dir, hair_sgment_model_path):
+        mod = importlib.import_module("hair_segment")
+        reload(mod)
+        segmentor = mod.HairSegment()
+        segmentor.load_model(hair_sgment_model_path)
+        for image_path in glob.glob(os.path.abspath(input_dir) + '/*.jpg'):
+            processed_img, true_img, _, _, _ = self.preprocess_image_with_cache(
+                    image_path, output_dir, segmentor, withCache=True,
+            )
+            if processed_img is None:
+                log(3, "processed_img is None! {0}", image_path)
+                continue
 
-class HairColorizationPyDataset(PyDataset):
-
-    def __init__(
-        self,
-        image_dir,
-        output_dir,
-        data_dir,
-        num_train_samples,
-        batch_size,
-        img_h, img_w,
-        preprocess_image_fn,
-        **kwargs
-    ):
-        super().__init__(**kwargs)
-        self.sample_expansion_rate = 3 # it's defined by the number of data points.
-        assert batch_size % self.sample_expansion_rate == 0,\
-                "batch_size({0}) must be divisible by {1}".format(batch_size, self.sample_expansion_rate)
-        self.data_list = glob.glob(path.abspath(data_dir) + f'/*.json')
-        assert len(self.data_list) >= num_train_samples,\
-                "length of data_list: {0}, num_train_samples: {1}".format(self.data_list, num_train_samples)
-        self.output_dir = path.abspath(output_dir)
-        self.image_dir, self.data_dir = path.abspath(image_dir), path.abspath(data_dir)
-        self.num_train_samples, self.batch_size = num_train_samples, batch_size
-        self.img_h, self.img_w = img_h, img_w
-        self.preprocess_image = preprocess_image_fn
-
-
-    def __len__(self):
-        # return number of batches.
-        return np.uint8(np.floor(self.num_train_samples * self.sample_expansion_rate / self.batch_size))
-
-    def __getitem__(self, idx):
-        data_idx = idx * self.batch_size // self.sample_expansion_rate
-        ll = 2
-
-        true_img_list, processed_img_list, hue_list = list(), list(), list()
-        feature_data_list = list()
-        while len(processed_img_list) < self.batch_size and data_idx < len(self.data_list):
-            json_path = self.data_list[data_idx]
-            data_idx += 1
-
-            hues = []
-            with open(json_path, 'r') as f:
+    def preprocess_image_with_cache(
+            self, image_path, data_dir, segmentor, withCache=True
+        ):
+        """
+            Preprocess image and cache it.
+            If withCache is False, then `window` is None.
+        """
+        log(3, "image_path: {0}", image_path)
+        image_name = os.path.basename(image_path)
+        splitted_name = os.path.splitext(image_name)
+        data_name = splitted_name[0] + '.json'
+        data_output_path = os.path.join(data_dir, data_name)
+        b_mask_name = splitted_name[0] + '-b-mask.npy'
+        b_mask_output_path = os.path.join(data_dir, b_mask_name)
+        label_img_name = splitted_name[0] + '-label-img.npy'
+        label_img_output_path = os.path.join(data_dir, label_img_name)
+        log(3, "data_output_path: {0}", data_output_path)
+        if withCache and os.path.exists(data_output_path) \
+            and os.path.exists(b_mask_output_path) and os.path.exists(label_img_output_path):
+            with open(data_output_path, 'r') as f:
                 try:
                     data = json.loads(f.read())
-                    # hues.append(data['min_hue'])
-                    # hues.append(data['max_hue'])
-                    hues.append(data['mean_hue'])
-                    hues.append(data['median_hue'])
-                    hues.append(data['mode_hue'])
                 except json.JSONDecodeError as e:
-                    raise "cannot parse: {0}, {1}".format(json_path, e)
-            # This is how we define the self.sample_expansion_rate
-            assert(len(hues) == self.sample_expansion_rate)
+                    raise "cannot parse: {0}, {1}".format(data_output_path, e)
+            img_rgb = cv.imread(image_path)
+            if img_rgb is None:
+                raise "cannot parse: {0}".format(img_path)
+            img_rgb = cv.cvtColor(img_rgb, cv.COLOR_BGR2RGB)
+            b_mask = np.load(b_mask_output_path)
+            label_img = np.load(label_img_output_path)
+        else:
+            img_rgb, b_mask, data, label_img = segmentor.make_data(image_path)
+            if data is None:
+                return None, None, None, None
+            if withCache:
+                with open(data_output_path, 'w') as f:
+                    json.dump(data, f)
+                np.save(b_mask_output_path, b_mask)
+                np.save(label_img_output_path, label_img)
 
-            json_name = path.basename(json_path)
-            splitted_name = path.splitext(json_name)
-            processed_img_path_list, feature_data_path_list, true_img_path_list = list(), list(), list()
-            all_caches_exist = True
-            for i in range(len(hues)):
-                processed_img_name = splitted_name[0] + '-processed-img-3-cache.' + str(i) + '.jpg'
-                feature_data_name = splitted_name[0] + '-feature-img-cache-1.' + str(i) + '.npy'
-                true_img_name = splitted_name[0] + '-true-img-cache.1.' + str(i) + '.jpg'
-                processed_img_path = os.path.join(self.data_dir, processed_img_name)
-                feature_data_path = os.path.join(self.data_dir, feature_data_name)
-                true_img_path = os.path.join(self.data_dir, true_img_name)
-                processed_img_path_list.append(processed_img_path)
-                feature_data_path_list.append(feature_data_path)
-                true_img_path_list.append(true_img_path)
-                all_caches_exist = all_caches_exist and os.path.exists(processed_img_path)\
-                    and  os.path.exists(feature_data_path) and os.path.exists(true_img_path)
+        gray_img = cv.cvtColor(img_rgb, cv.COLOR_RGB2GRAY)
 
-            if all_caches_exist:
-                for i in range(len(hues)):
-                    processed_img_path = processed_img_path_list[i]
-                    feature_data_path = feature_data_path_list[i]
-                    true_img_path = true_img_path_list[i]
-                    processed_img = cv.imread(processed_img_path)
-                    true_img = cv.imread(true_img_path)
-                    if processed_img is not None and true_img is not None:
-                        processed_img = cv.cvtColor(processed_img, cv.COLOR_BGR2HSV)
-                        feature_data = np.load(feature_data_path)
-                        true_img = cv.cvtColor(true_img, cv.COLOR_BGR2HSV)
+        processed_img_name = splitted_name[0] + self.processed_img_cache_suffix
+        processed_img_path = os.path.join(data_dir, processed_img_name)
+        true_img_name = splitted_name[0] + self.true_img_cache_suffix
+        true_img_path = os.path.join(data_dir, true_img_name)
 
-                        # no need to predict Value in HSV, so remove it
-                        true_img = true_img[:,:,:2]
+        if withCache and os.path.exists(processed_img_path) and os.path.exists(true_img_path):
+            window = None
+            processed_img = np.load(processed_img_path)
+            true_img_hsv = cv.imread(true_img_path)
+            if true_img_hsv is None:
+                raise "cannot parse: {0}".format(true_img_path)
+            true_img_bgr = cv.cvtColor(true_img_hsv, cv.COLOR_BGR2RGB)
+        else:
+            processed_img, true_img_bgr, window = self.preprocess_image(
+                img_rgb, gray_img, b_mask, label_img, data_dir
+            )
+            if withCache:
+                np.save(processed_img_path, processed_img)
+                cv.imwrite(true_img_path, cv.cvtColor(true_img_hsv, cv.COLOR_RGB2BGR))
+        true_img_hsv = cv.cvtColor(true_img_bgr, cv.COLOR_BGR2HSV)
+        true_img_hsv = true_img_hsv[:,:,:2]
+        return processed_img, true_img_hsv, img_rgb, b_mask, window
 
-                        hue_list.append(hues[i])
-                        processed_img_list.append(processed_img)
-                        feature_data_list.append(feature_data)
-                        true_img_list.append(true_img)
-                    else:
-                        if processed_img is None:
-                            log(4, "cannot read the processed_img cache! {0}", processed_img_path)
-                        if true_img is None:
-                            log(4, "cannot read the true_img cache! {0}", true_img_path)
-                        raise "couldn't read cache file! {0}, {1}".format(processed_img_path, true_img_path)
-                continue
-            else:
-                log(4, "No cache for {0}!", json_path)
 
-            image_name = splitted_name[0] + '.jpg'
-            gray_name = splitted_name[0] + '-gray-hair.jpg'
-            b_mask_name = splitted_name[0] + '-b-mask.png'
-            image_path = os.path.join(self.image_dir, image_name)
-            gray_path = os.path.join(self.data_dir, gray_name)
-            b_mask_path = os.path.join(self.data_dir, b_mask_name)
+    def preprocess_image_load_cache(
+            self, data_output_path, data_dir, withCache=True
+        ):
+        """
+            Load preprocess image from cache.
+        """
+        data_name = os.path.basename(data_output_path)
+        splitted_name = os.path.splitext(data_name)
+        processed_img_name = splitted_name[0] + self.processed_img_cache_suffix
+        processed_img_path = os.path.join(data_dir, processed_img_name)
+        true_img_name = splitted_name[0] + self.true_img_cache_suffix
+        true_img_path = os.path.join(data_dir, true_img_name)
 
-            img = cv.imread(image_path)
-            if img is None:
-                raise "cannot parse: {0}".format(image_path)
-            img = cv.cvtColor(img, cv.COLOR_BGR2HSV)
+        with open(data_output_path, 'r') as f:
+            try:
+                data = json.loads(f.read())
+            except json.JSONDecodeError as e:
+                raise "cannot parse: {0}, {1}".format(data_output_path, e)
+        processed_img = np.load(processed_img_path)
+        true_img_hsv = cv.imread(true_img_path)
+        if true_img_hsv is None:
+            raise "cannot parse: {0}".format(true_img_path)
+        true_img_hsv = cv.cvtColor(true_img_hsv, cv.COLOR_BGR2HSV)
+        true_img_hsv = true_img_hsv[:,:,:2]
+        return processed_img, true_img_hsv, data
 
-            gray_img = cv.imread(gray_path)
-            if gray_img is None:
-                raise "cannot parse gray image: {0}".format(gray_path)
-            gray_img = cv.cvtColor(gray_img, cv.COLOR_BGR2HSV)
-
-            b_mask = cv.imread(b_mask_path)
-            if b_mask is None:
-                raise "cannot parse b-mask: {0}".format(b_mask_path)
-
-            for i in range(len(hues)):
-                hue = hues[i]
-                processed_img, true_img, feature_data, _ = self.preprocess_image(
-                    img, hue, gray_img, b_mask, self.output_dir
-                )
-
-                processed_img_path = processed_img_path_list[i]
-                feature_data_path = feature_data_path_list[i]
-                true_img_path = true_img_path_list[i]
-                log(ll, "processed_img_path: {0}", processed_img_path)
-                log(ll, "true_img_path: {0}", true_img_path)
-                cv.imwrite(processed_img_path, cv.cvtColor(processed_img, cv.COLOR_HSV2BGR))
-                cv.imwrite(true_img_path,cv.cvtColor(true_img, cv.COLOR_HSV2BGR))
-                np.save(feature_data_path, feature_data)
-
-                # no need to predict Value in HSV, so remove it
-                true_img = true_img[:,:,:2]
-
-                hue_list.append(hue)
-                processed_img_list.append(processed_img)
-                feature_data_list.append(feature_data)
-                true_img_list.append(true_img)
-
-            log(ll, "len processed_img_list: {0}", len(processed_img_list))
-            log(ll, "image_name: {0}", image_name)
-            log(ll, "processed_img shape: {0}", processed_img.shape)
-            log(ll, "true_img shape: {0}", true_img.shape)
-
-        processed_img_list = np.array(processed_img_list)
-        feature_data_list = np.array(feature_data_list)
-        hue_list = np.array(hue_list)
-        true_img_list = np.array(true_img_list)
-        log(ll, "processed_img_list shape: {0}", processed_img_list.shape)
-        log(ll, "hue_list shape: {0}", hue_list.shape)
-        log(ll, "img_true_list shape: {0}", true_img_list.shape)
-        log(ll, "idx: {0}", idx)
-        log(ll, "data_idx: {0}", data_idx)
-        log(ll, "len data_list: {0}", len(self.data_list))
-        assert processed_img_list.shape[0] != 0,\
-                "processed_img_list is empty! __len__: {0}, len data_list: {1}, current_idx: {2}, idx: {3}"\
-                .format(self.__len__(), len(self.data_list), data_idx, idx)
-        return (
-            (processed_img_list, feature_data_list, hue_list),
-            true_img_list,
-        )
 
 # Helper function to both segment the hairs and color them.
 def predict(image_path, hue, hair_sgment_model_path, hair_colorization_model_path, output_dir):
@@ -754,26 +551,17 @@ def predict(image_path, hue, hair_sgment_model_path, hair_colorization_model_pat
     import sys
     import torch
     torch.cuda.empty_cache()
-    sys.path.append(dir_path)
-    segment_mod = importlib.import_module('hair_segment')
-    segmentor = segment_mod.HairSegment()
-    segmentor.load_model(hair_sgment_model_path)
-    img, b_mask, _ = segmentor.make_data(image_path)
-    gray_img = segmentor.make_gray_hair(img, b_mask)
-    img = cv.cvtColor(img, cv.COLOR_RGB2HSV)
-    gray_img = cv.cvtColor(cv.cvtColor(gray_img, cv.COLOR_GRAY2BGR), cv.COLOR_RGB2HSV)
-    del segmentor
-    # the trained model expects 240x240 image size
-    colorizor = HairColorization(240, 240)
-    colorizor.load_model(hair_colorization_model_path)
-    result = colorizor.predict(img, b_mask, gray_img, hue, output_dir)
+    mod = importlib.import_module("hair_segment")
+    reload(mod)
+    segmentor = mod.HairSegment()
+    colorizor = HairColorization(hair_colorization_model_path)
+    img_rgb, result_rgb = colorizor.predict(image_path, hue, segmentor, hair_sgment_model_path, output_dir)
     del colorizor
     torch.cuda.empty_cache()
 
-    logImage(3, output_dir, img)
-    result = cv.cvtColor(result, cv.COLOR_HSV2BGR)
-    logImage(3, output_dir, result, img_space=LOG_BGR_IMAGE)
-    return result
+    logImage(3, output_dir, img_rgb, img_space=LOG_RGB_IMAGE)
+    logImage(3, output_dir, result_rgb, img_space=LOG_RGB_IMAGE)
+    return result_rgb
 
 
 """
@@ -781,6 +569,7 @@ Image spaces used by logger.
 """
 LOG_HSV_IMAGE = 0
 LOG_BGR_IMAGE = 1
+LOG_RGB_IMAGE = 2
 
 def logImage(level, output_dir, img, img_space=LOG_HSV_IMAGE):
     """
@@ -792,8 +581,16 @@ def logImage(level, output_dir, img, img_space=LOG_HSV_IMAGE):
        img_path = output_dir + f'/.log_img.png'
        if img_space == LOG_HSV_IMAGE:
            img = cv.cvtColor(img, cv.COLOR_HSV2BGR)
+       elif img_space == LOG_RGB_IMAGE:
+           img = cv.cvtColor(img, cv.COLOR_RGB2BGR)
        cv.imwrite(img_path, img)
        display(Image(filename=img_path, height=600))
+
+def logImageWithPath(level, output_dir, img_path):
+    log(level, "file exists: {0}", os.path.exists(img_path))
+    img = cv.imread(img_path)
+    img = cv.cvtColor(img, cv.COLOR_BGR2HSV)
+    logImage(level, output_dir, img)
 
 def log(level, s, *arg):
     if level > 2:

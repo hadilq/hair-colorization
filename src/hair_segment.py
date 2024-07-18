@@ -12,12 +12,12 @@ class HairSegment:
         self.model = YOLO(model_path)
 
     def find_mask(self, original_image_path):
-        img, masks = self.find_contours(original_image_path)
-        if img is None:
-            return (img, None)
-        b_mask = np.zeros(img.shape[:2], np.uint8)
+        img_rgb, masks = self.find_contours(original_image_path)
+        if img_rgb is None:
+            return img_rgb, None, None, None
+        b_mask = np.zeros(img_rgb.shape[:2], np.uint8)
         if masks is None:
-            return (img, b_mask)
+            return img_rgb, b_mask, None, None
 
         self.fill_b_mask(b_mask, masks)
         area = self.calculate_area(b_mask)
@@ -25,11 +25,11 @@ class HairSegment:
         while area and not hairy_label:
             expanded_b_mask = self.fill_expanded_b_mask(area, b_mask)
 
-            vectorized_pixels, map_xy_to_position = self.prepare_vectorized_pixels(img, expanded_b_mask)
+            vectorized_pixels, map_xy_to_position = self.prepare_vectorized_pixels(img_rgb, expanded_b_mask)
             log(3, "vectorized_pixels len: {0}", len(vectorized_pixels))
             label, K = self.optimize_k_means(vectorized_pixels)
 
-            label_img = self.create_label_img(img.shape[:2], label, map_xy_to_position)
+            label_img = self.create_label_img(img_rgb.shape[:2], label, map_xy_to_position)
             log(3, "label_img shape: {0}", label_img.shape)
 
             hairy_label = self.find_hairy_label(b_mask, K, label_img)
@@ -38,7 +38,7 @@ class HairSegment:
 
         self.remove_not_hairy_from_b_mask(b_mask, label_img, hairy_label)
 
-        return (img, b_mask)
+        return img_rgb, b_mask, label_img, hairy_label
 
     def find_contours(self, original_image_path):
         # Run batched inference on a list of images
@@ -49,8 +49,8 @@ class HairSegment:
 
         masks = result.masks
 
-        img = cv.cvtColor(original_image, cv.COLOR_BGR2RGB)
-        return (img, masks)
+        img_rgb = cv.cvtColor(original_image, cv.COLOR_BGR2RGB)
+        return (img_rgb, masks)
 
     def fill_b_mask(self, b_mask, masks):
         for contour in masks.xy:
@@ -124,6 +124,7 @@ class HairSegment:
         return label, K
 
     def create_label_img(self, img_shape, label, map_xy_to_position):
+        # it'll be a matrix full of 255
         label_img = np.full(img_shape, -1, np.uint8)
         for y in range(label_img.shape[0]):
             for x in range(label_img.shape[1]):
@@ -161,92 +162,117 @@ class HairSegment:
                 if l != 255 and l not in hairy_label and b_mask[y][x]:
                     b_mask[y][x] = 0
 
-    def make_dataset(self, input_dir, output_dir):
-        import glob
-        import json
-        for image_path in glob.glob(os.path.abspath(input_dir) + '/*.jpg'):
-            log(3, "image_path: {0}", image_path)
-            image_name = os.path.basename(image_path)
-            splitted_name = os.path.splitext(image_name)
-            data_name = splitted_name[0] + '.json'
-            data_output_path = os.path.join(output_dir, data_name)
-            gray_name = splitted_name[0] + '-gray-hair.jpg'
-            gray_output_path = os.path.join(output_dir, gray_name)
-            b_mask_name = splitted_name[0] + '-b-mask.png'
-            b_mask_output_path = os.path.join(output_dir, b_mask_name)
-            log(3, "data_output_path: {0}", data_output_path)
-            if os.path.exists(data_output_path) and os.path.exists(gray_output_path)\
-                and os.path.exists(b_mask_output_path):
+    def confine_label_img_to_hairy_ones(self, b_mask, label_img, hairy_label):
+        """
+            Modify label_img to only contains hairy labels
+        """
+        for y, m_y in enumerate(b_mask):
+            for x, m in enumerate(m_y):
+                if label_img[y][x] != 255 or label_img[y][x] not in hairy_label or not m:
+                    label_img[y][x] = 255
+
+    def label_sampling(self, img, label_img, hairy_label):
+        """
+            Modify label_img to put sample data instead of meaningless label number.
+        """
+        img_hsv = cv.cvtColor(img, cv.COLOR_RGB2HSV)
+        label_sample_img = np.full((img.shape[0], img.shape[1], 6), -1, dtype = np.uint8)
+        for l in hairy_label:
+            sample_saturation = []
+            sample_value = []
+            for y, l_y in enumerate(label_img):
+                for x, pixel_lable in enumerate(l_y):
+                    if pixel_lable == l:
+                        sample_saturation.append(img_hsv[y][x][1])
+                        sample_value.append(img_hsv[y][x][2])
+            if not sample_saturation or not sample_value:
                 continue
-            img, b_mask, data = self.make_data(image_path)
-            if data is None:
-                continue
-            log(3, "data: {0}", data)
-            with open(data_output_path, 'w') as f:
-                json.dump(data, f)
-            gray_img = self.make_gray_hair(img, b_mask)
-            cv.imwrite(gray_output_path, cv.cvtColor(gray_img, cv.COLOR_GRAY2BGR))
-            cv.imwrite(b_mask_output_path, b_mask)
+            data = self.calculate_data(sample_saturation)
+            data.extend(self.calculate_data(sample_value))
+            data = np.array(data, dtype = np.uint8)
+
+            for y, l_y in enumerate(label_img):
+                for x, pixel_lable in enumerate(l_y):
+                    if pixel_lable == l:
+                        label_sample_img[y][x] = data
+        return label_sample_img
+
+    def calculate_data(self, sample):
+        """
+            return a list of mean, median, and mod of the sample
+        """
+        if sample is None or len(sample) == 0:
+            return [0, 0, 0]
+        sample = np.sort(sample, axis=None)
+        median = 0.0
+        if len(sample) % 2 == 0:
+            middle = len(sample) // 2
+            median = (1.0 * sample[middle] + sample[middle + 1]) / 2
+        else:
+            median = 1.0 * sample[len(sample) // 2 + 1]
+
+        mode, last_value = -1, -1
+        count = 0
+        max_count = 0
+        mean = 0.0
+        for value in sample:
+            if value == last_value:
+                count += 1
+            else:
+                count = 0
+                last_value = value
+
+            if count >= max_count:
+                max_count = count
+                mode = value
+
+            mean += value
+
+        mean = mean // len(sample)
+
+        return [int(mean), int(median), int(mode)]
 
     def make_data(self, image_path):
-        img, b_mask = self.find_mask(image_path)
+        """
+            Pre-process image and extract data.
+            Return img, b_mask, data, label_img.
+        """
+        img, b_mask, label_img, hairy_label = self.find_mask(image_path)
+        if label_img is None:
+            return img, b_mask, None, None
+        self.confine_label_img_to_hairy_ones(b_mask, label_img, hairy_label)
+        label_img = self.label_sampling(img, label_img, hairy_label)
         if img is None or img.size == 0:
             log(3, "cannot find mask!")
-            return img, b_mask, None
+            return img, b_mask, None, None
 
-        sample = []
+        img_hsv = cv.cvtColor(img, cv.COLOR_RGB2HSV)
+        sample_in_hue = []
         for y in range(b_mask.shape[0]):
           for x in range(b_mask.shape[1]):
             if b_mask[y][x]:
-              sample.append(img[x][y])
+              sample_in_hue.append(img_hsv[x][y])
 
-        if len(sample) == 0:
-            return img, b_mask, None
+        if len(sample_in_hue) == 0:
+            return img, b_mask, None, None
 
-        sample_in_hue = cv.cvtColor(np.array([sample]), cv.COLOR_RGB2HSV)[0][:, :1]
-        sample_in_hue = sample_in_hue.reshape((sample_in_hue.shape[0],))
-        log(2, "sample shape: {0}, sample type: {1}", sample_in_hue.shape, sample_in_hue.dtype)
-        min_hue = np.uint8(179)
-        max_hue = np.uint8(0)
-        mean_hue = np.float32(0.0)
-        for h in sample_in_hue:
-            min_hue = min(min_hue, h)
-            max_hue = max(max_hue, h)
-            mean_hue += h
+        sample_in_hue = cv.cvtColor(np.array([sample_in_hue]), cv.COLOR_RGB2HSV)[0][:, :1]
+        mean_hue, median_hue, mode_hue = self.calculate_data(sample_in_hue)
 
-        mean_hue /= np.float32(len(sample_in_hue))
-
-        sample_in_hue = np.sort(sample_in_hue, axis=None)
-        median_hue = np.uint8(0)
-        if len(sample_in_hue) % 2 == 0:
-            middle = len(sample_in_hue) // 2
-            median_hue = np.uint8((sample_in_hue[middle] + sample_in_hue[middle + 1]) / 2)
-        else:
-            median_hue = np.uint8(sample_in_hue[len(sample_in_hue) // 2 + 1])
-
-        mean_hue = np.uint8(np.floor(mean_hue))
-        mode_hue = np.uint8(0)
-        last_hue = np.uint8(-1)
-        count = 0
-        max_count = 0
-        for hue in sample_in_hue:
-            if hue == last_hue:
-                count += 1
-            else:
-                last_hue = hue
-            if count > max_count:
-                max_count = count
-                mode_hue = hue
+        masked_area = 0
+        for y, m_y in enumerate(b_mask):
+            for x, m in enumerate(m_y):
+                if m:
+                    masked_area += 1
 
         data = {
-            'min_hue': min_hue.item(),
-            'max_hue': max_hue.item(),
-            'mean_hue': mean_hue.item(),
-            'median_hue': median_hue.item(),
-            'mode_hue': mode_hue.item()
+            'mean_hue': mean_hue,
+            'median_hue': median_hue,
+            'mode_hue': mode_hue,
+            'masked_area': masked_area,
         }
         log(3, "data: {0}", data)
-        return img, b_mask, data
+        return img, b_mask, data, label_img
 
     def make_gray_hair(self, img, b_mask):
         gray_img = img.copy()
@@ -278,7 +304,7 @@ def predict(image_path):
     hair_segment_predictor = HairSegmentPredictor()
     hair_segment_predictor.setup()
 
-    img, b_mask = hair_segment_predictor.find_mask(image_path)
+    img, b_mask, _, _ = hair_segment_predictor.find_mask(image_path)
     if img is None or img.size == 0:
         return None
 
